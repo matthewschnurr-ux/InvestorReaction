@@ -767,22 +767,28 @@ def show_survey_overview(df, per_question, questions):
     # Sentiment by question heatmap
     st.subheader("Sentiment by Question")
     heatmap_data = []
+    q_labels = []
     for qnum in range(1, len(questions) + 1):
         qa = per_question.get(qnum, {})
         sc = qa.get("sentiment_counts", {})
-        label = f"Q{qnum}: {questions[qnum-1][:80]}"
-        heatmap_data.append({
-            "Question": label,
-            "Positive": sc.get("positive", 0),
-            "Neutral": sc.get("neutral", 0),
-            "Mixed": sc.get("mixed", 0),
-            "Negative": sc.get("negative", 0),
-        })
-    heatmap_df = pd.DataFrame(heatmap_data).set_index("Question")
-    st.dataframe(
-        heatmap_df.style.background_gradient(cmap="RdYlGn", axis=1),
-        use_container_width=True,
-    )
+        label = f"Q{qnum}: {questions[qnum-1][:60]}"
+        q_labels.append(label)
+        heatmap_data.append([
+            sc.get("positive", 0),
+            sc.get("neutral", 0),
+            sc.get("mixed", 0),
+            sc.get("negative", 0),
+        ])
+    fig = go.Figure(data=go.Heatmap(
+        z=heatmap_data,
+        x=["Positive", "Neutral", "Mixed", "Negative"],
+        y=q_labels,
+        colorscale="RdYlGn",
+        texttemplate="%{z}",
+        hovertemplate="Question: %{y}<br>%{x}: %{z}<extra></extra>",
+    ))
+    fig.update_layout(height=max(250, len(questions) * 50), yaxis_autorange="reversed")
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def show_per_question_analysis(df, per_question, questions):
