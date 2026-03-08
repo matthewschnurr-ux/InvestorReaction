@@ -809,7 +809,7 @@ def show_per_question_analysis(df, per_question, questions):
                     color_discrete_map=SENTIMENT_COLORS,
                 )
                 fig.update_traces(textposition="inside", textinfo="percent+label")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"sq_sent_{qnum}")
 
             with c2:
                 conf_order = ["low", "medium", "high"]
@@ -822,7 +822,7 @@ def show_per_question_analysis(df, per_question, questions):
                     title="Confidence Level",
                     color_discrete_sequence=["#8e44ad"],
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"sq_conf_{qnum}")
 
             # Themes
             if qa.get("top_themes"):
@@ -833,7 +833,7 @@ def show_per_question_analysis(df, per_question, questions):
                     color_discrete_sequence=["#2d5a87"],
                 )
                 fig.update_layout(height=max(300, len(themes_df) * 28))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"sq_themes_{qnum}")
 
             # Sentiment by age group
             st.markdown("**Sentiment by Age Group**")
@@ -844,7 +844,7 @@ def show_per_question_analysis(df, per_question, questions):
                     barmode="group", color_discrete_map=SENTIMENT_COLORS,
                     labels={"age_group": "Age Group", "count": "Count"},
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"sq_age_{qnum}")
 
             # Sentiment by income
             st.markdown("**Sentiment by Income Bracket**")
@@ -855,7 +855,7 @@ def show_per_question_analysis(df, per_question, questions):
                     barmode="group", color_discrete_map=SENTIMENT_COLORS,
                     labels={"income_bracket": "Income Bracket", "count": "Count"},
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"sq_inc_{qnum}")
 
 
 def show_survey_responses(df, questions):
