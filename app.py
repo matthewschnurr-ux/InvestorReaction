@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Canadian Investor Persona Reactor - Streamlit Web App
-Test investment ideas against 1,000 synthetic Canadian investor personas.
+Canadian Persona Reactor & Survey Tool - Streamlit Web App
+Test investment ideas and run custom surveys against 1,000 synthetic Canadian personas.
 """
 
 import streamlit as st
@@ -54,6 +54,31 @@ Respond ONLY with valid JSON in this exact format (no markdown, no code fences):
   "verbatim_quote": "<2-3 sentences as if talking to a friend about this>"
 }}"""
 
+SURVEY_PROMPT = """You are roleplaying as this Canadian persona. Stay fully in character. Think and respond as this specific person would, given their background, demographics, financial situation, values, and life circumstances.
+
+PERSONA:
+{persona}
+
+You are being surveyed. Answer each question honestly and naturally from this persona's perspective. Consider your age, income, education, family situation, values, location, and life experiences.
+
+QUESTIONS:
+{questions_formatted}
+
+Respond ONLY with valid JSON in this exact format (no markdown, no code fences):
+{{
+  "answers": [
+    {{
+      "question_number": 1,
+      "answer": "<your natural, in-character answer in 1-3 sentences>",
+      "sentiment": "<positive|neutral|negative|mixed>",
+      "confidence": "<low|medium|high>",
+      "key_themes": ["<theme1>", "<theme2>"]
+    }}
+  ]
+}}
+
+Include one entry in the "answers" array for each question, in order."""
+
 
 # ============================================================
 # PAGE CONFIG
@@ -81,13 +106,6 @@ st.markdown("""
     div[data-testid="stExpander"] {
         border: 1px solid #e0e0e0;
         border-radius: 8px;
-    }
-    .quote-card {
-        background: #f8f9fa;
-        border-left: 4px solid #2d5a87;
-        padding: 16px;
-        margin: 10px 0;
-        border-radius: 0 8px 8px 0;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -126,8 +144,36 @@ def stratified_sample(personas, n):
     return sampled[:n]
 
 
+def attach_persona_metadata(result, persona):
+    """Attach persona demographic metadata to an API result."""
+    result["persona_id"] = persona["id"]
+    result["persona_name"] = f"{persona['first_name']} {persona['last_name']}"
+    result["age"] = persona["age"]
+    result["gender"] = persona["gender"]
+    result["ethnicity"] = persona["ethnicity"]
+    result["province"] = persona["province"]
+    result["city"] = persona["city"]
+    result["income"] = persona["household_income"]
+    result["net_worth"] = persona["net_worth"]
+    result["risk_tolerance_profile"] = persona["risk_tolerance"]
+    result["life_stage"] = persona["life_stage"]
+    result["investment_knowledge"] = persona["investment_knowledge"]
+    result["education"] = persona["education"]
+    result["family_status"] = persona.get("family_status", "")
+    return result
+
+
+def make_error_result(persona, error_msg):
+    """Create an error result dict for a persona."""
+    return {
+        "persona_id": persona["id"],
+        "persona_name": f"{persona['first_name']} {persona['last_name']}",
+        "error": error_msg,
+    }
+
+
 # ============================================================
-# API CALLS
+# API CALLS - REACTOR
 # ============================================================
 
 def get_reaction(client, persona, idea):
@@ -149,25 +195,12 @@ def get_reaction(client, persona, idea):
                 text = re.sub(r"^```(?:json)?\s*", "", text)
                 text = re.sub(r"\s*```$", "", text)
             reaction = json.loads(text)
-            reaction["persona_id"] = persona["id"]
-            reaction["persona_name"] = f"{persona['first_name']} {persona['last_name']}"
-            reaction["age"] = persona["age"]
-            reaction["gender"] = persona["gender"]
-            reaction["ethnicity"] = persona["ethnicity"]
-            reaction["province"] = persona["province"]
-            reaction["city"] = persona["city"]
-            reaction["income"] = persona["household_income"]
-            reaction["net_worth"] = persona["net_worth"]
-            reaction["risk_tolerance_profile"] = persona["risk_tolerance"]
-            reaction["life_stage"] = persona["life_stage"]
-            reaction["investment_knowledge"] = persona["investment_knowledge"]
-            reaction["education"] = persona["education"]
-            return reaction
+            return attach_persona_metadata(reaction, persona)
         except json.JSONDecodeError:
             if attempt < 2:
                 time.sleep(1)
                 continue
-            return {"persona_id": persona["id"], "persona_name": f"{persona['first_name']} {persona['last_name']}", "error": "JSON parse error"}
+            return make_error_result(persona, "JSON parse error")
         except Exception as e:
             if "429" in str(e) or "quota" in str(e).lower():
                 time.sleep((attempt + 1) * 10)
@@ -175,7 +208,7 @@ def get_reaction(client, persona, idea):
             if attempt < 2:
                 time.sleep(2)
                 continue
-            return {"persona_id": persona["id"], "persona_name": f"{persona['first_name']} {persona['last_name']}", "error": str(e)[:100]}
+            return make_error_result(persona, str(e)[:100])
 
 
 def collect_reactions(personas, idea):
@@ -184,10 +217,9 @@ def collect_reactions(personas, idea):
     reactions = []
     completed = 0
     errors = 0
-    delay = 60.0 / 450  # stay under rate limit
+    delay = 60.0 / 450
 
     progress_bar = st.progress(0, text=f"Starting... 0/{total}")
-    status_container = st.empty()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_persona = {}
@@ -202,7 +234,6 @@ def collect_reactions(personas, idea):
             reactions.append(result)
             if "error" in result:
                 errors += 1
-
             progress_bar.progress(
                 completed / total,
                 text=f"Collected {completed}/{total} reactions ({errors} errors)"
@@ -213,7 +244,82 @@ def collect_reactions(personas, idea):
 
 
 # ============================================================
-# ANALYSIS HELPERS
+# API CALLS - SURVEY
+# ============================================================
+
+def get_survey_response(client, persona, questions):
+    questions_formatted = "\n".join(f"Q{i}. {q}" for i, q in enumerate(questions, 1))
+    prompt = SURVEY_PROMPT.format(
+        persona=persona["persona_summary"],
+        questions_formatted=questions_formatted,
+    )
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.8,
+                    max_output_tokens=min(300 * len(questions), 8000),
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            text = response.text.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\s*", "", text)
+                text = re.sub(r"\s*```$", "", text)
+            result = json.loads(text)
+            return attach_persona_metadata(result, persona)
+        except json.JSONDecodeError:
+            if attempt < 2:
+                time.sleep(1)
+                continue
+            return make_error_result(persona, "JSON parse error")
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                time.sleep((attempt + 1) * 10)
+                continue
+            if attempt < 2:
+                time.sleep(2)
+                continue
+            return make_error_result(persona, str(e)[:100])
+
+
+def collect_survey_responses(personas, questions):
+    client = genai.Client(api_key=API_KEY)
+    total = len(personas)
+    responses = []
+    completed = 0
+    errors = 0
+    delay = 60.0 / 450
+
+    progress_bar = st.progress(0, text=f"Starting survey... 0/{total}")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_persona = {}
+        for persona in personas:
+            future = executor.submit(get_survey_response, client, persona, questions)
+            future_to_persona[future] = persona
+            time.sleep(delay)
+
+        for future in as_completed(future_to_persona):
+            completed += 1
+            result = future.result()
+            responses.append(result)
+            if "error" in result:
+                errors += 1
+            progress_bar.progress(
+                completed / total,
+                text=f"Surveyed {completed}/{total} personas ({errors} errors)"
+            )
+
+    progress_bar.progress(1.0, text=f"Done! {total} personas surveyed ({errors} errors)")
+    return responses
+
+
+# ============================================================
+# ANALYSIS - REACTOR
 # ============================================================
 
 def build_analysis(reactions):
@@ -223,23 +329,18 @@ def build_analysis(reactions):
 
     df = pd.DataFrame(valid)
 
-    # Ensure types
     df["interest_score"] = pd.to_numeric(df["interest_score"], errors="coerce")
     df["would_invest"] = df["would_invest"].astype(bool)
     df["income"] = pd.to_numeric(df["income"], errors="coerce")
     df["net_worth"] = pd.to_numeric(df["net_worth"], errors="coerce")
     df["age"] = pd.to_numeric(df["age"], errors="coerce")
 
-    # Age group
     df["age_group"] = pd.cut(df["age"], bins=[0, 34, 54, 100], labels=["18-34", "35-54", "55+"])
-
-    # Income bracket
     df["income_bracket"] = pd.cut(
         df["income"], bins=[0, 60000, 120000, float("inf")],
         labels=["Under $60K", "$60K-$120K", "$120K+"]
     )
 
-    # Flatten concerns and appeals
     all_concerns = []
     all_appeals = []
     all_helps = []
@@ -264,8 +365,81 @@ def build_analysis(reactions):
 
 
 # ============================================================
-# DISPLAY FUNCTIONS
+# ANALYSIS - SURVEY
 # ============================================================
+
+def build_survey_analysis(responses, questions):
+    valid = [r for r in responses if "error" not in r]
+    if not valid:
+        return None, None
+
+    # Build long-format DataFrame: one row per persona per question
+    rows = []
+    for resp in valid:
+        answers = resp.get("answers", [])
+        for ans in answers:
+            qnum = ans.get("question_number", 0)
+            if 1 <= qnum <= len(questions):
+                rows.append({
+                    "persona_id": resp["persona_id"],
+                    "persona_name": resp["persona_name"],
+                    "age": resp["age"],
+                    "gender": resp["gender"],
+                    "ethnicity": resp["ethnicity"],
+                    "province": resp["province"],
+                    "city": resp.get("city", ""),
+                    "income": resp["income"],
+                    "net_worth": resp["net_worth"],
+                    "risk_tolerance_profile": resp["risk_tolerance_profile"],
+                    "life_stage": resp["life_stage"],
+                    "investment_knowledge": resp["investment_knowledge"],
+                    "education": resp["education"],
+                    "family_status": resp.get("family_status", ""),
+                    "question_number": qnum,
+                    "question_text": questions[qnum - 1],
+                    "answer": ans.get("answer", ""),
+                    "sentiment": ans.get("sentiment", "neutral"),
+                    "confidence": ans.get("confidence", "medium"),
+                    "key_themes": ans.get("key_themes", []),
+                })
+
+    if not rows:
+        return None, None
+
+    df = pd.DataFrame(rows)
+    df["age"] = pd.to_numeric(df["age"], errors="coerce")
+    df["income"] = pd.to_numeric(df["income"], errors="coerce")
+    df["age_group"] = pd.cut(df["age"], bins=[0, 34, 54, 100], labels=["18-34", "35-54", "55+"])
+    df["income_bracket"] = pd.cut(
+        df["income"], bins=[0, 60000, 120000, float("inf")],
+        labels=["Under $60K", "$60K-$120K", "$120K+"]
+    )
+
+    # Per-question aggregation
+    per_question = {}
+    for qnum in range(1, len(questions) + 1):
+        q_df = df[df["question_number"] == qnum]
+        all_themes = []
+        for themes in q_df["key_themes"]:
+            if isinstance(themes, list):
+                all_themes.extend(themes)
+        per_question[qnum] = {
+            "question": questions[qnum - 1],
+            "response_count": len(q_df),
+            "sentiment_counts": q_df["sentiment"].value_counts().to_dict(),
+            "confidence_counts": q_df["confidence"].value_counts().to_dict(),
+            "top_themes": Counter(all_themes).most_common(15),
+        }
+
+    return df, per_question
+
+
+# ============================================================
+# DISPLAY - REACTOR
+# ============================================================
+
+SENTIMENT_COLORS = {"positive": "#2ecc71", "neutral": "#95a5a6", "negative": "#e74c3c", "mixed": "#f39c12"}
+
 
 def show_overview(df):
     st.subheader("Key Metrics")
@@ -295,22 +469,19 @@ def show_overview(df):
 
     with c2:
         sent_counts = df["sentiment"].value_counts()
-        colors = {"positive": "#2ecc71", "neutral": "#95a5a6", "negative": "#e74c3c", "mixed": "#f39c12"}
         fig = px.pie(
             values=sent_counts.values, names=sent_counts.index,
             title="Sentiment Breakdown",
             color=sent_counts.index,
-            color_discrete_map=colors,
+            color_discrete_map=SENTIMENT_COLORS,
         )
         fig.update_traces(textposition="inside", textinfo="percent+label")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Investment amount willingness
     if "investment_amount" in df.columns:
         amount_order = ["none", "small ($100-$1K)", "moderate ($1K-$10K)", "significant ($10K-$50K)", "major ($50K+)"]
         amt_counts = df["investment_amount"].value_counts()
         amt_df = pd.DataFrame({"Amount": amt_counts.index, "Count": amt_counts.values})
-        # Sort by order
         amt_df["sort_key"] = amt_df["Amount"].apply(lambda x: amount_order.index(x) if x in amount_order else 99)
         amt_df = amt_df.sort_values("sort_key")
         fig = px.bar(
@@ -324,7 +495,6 @@ def show_overview(df):
 def show_demographics(df):
     st.subheader("Breakdown by Demographics")
 
-    # By Age Group
     c1, c2 = st.columns(2)
     with c1:
         age_stats = df.groupby("age_group", observed=True).agg(
@@ -353,7 +523,6 @@ def show_demographics(df):
         fig.update_layout(yaxis_range=[0, 100])
         st.plotly_chart(fig, use_container_width=True)
 
-    # By Risk Tolerance
     risk_order = ["Very Conservative", "Conservative", "Moderate", "Growth", "Aggressive"]
     c1, c2 = st.columns(2)
     with c1:
@@ -389,7 +558,6 @@ def show_demographics(df):
         fig.update_layout(yaxis_range=[0, 10])
         st.plotly_chart(fig, use_container_width=True)
 
-    # By Province (top 6)
     prov_stats = df.groupby("province", observed=True).agg(
         avg_score=("interest_score", "mean"),
         would_invest_pct=("would_invest", lambda x: x.mean() * 100),
@@ -406,7 +574,6 @@ def show_demographics(df):
     fig.update_layout(yaxis_range=[0, 10])
     st.plotly_chart(fig, use_container_width=True)
 
-    # By Investment Knowledge
     c1, c2 = st.columns(2)
     with c1:
         know_order = ["Beginner", "Some knowledge", "Knowledgeable", "Advanced", "Expert"]
@@ -474,7 +641,6 @@ def show_insights(df, analysis):
             fig.update_layout(height=400)
             st.plotly_chart(fig, use_container_width=True)
 
-    # What would help
     st.markdown("**What Would Make Them More Likely to Invest**")
     if analysis["what_would_help"]:
         helps = Counter(analysis["what_would_help"]).most_common(15)
@@ -485,7 +651,6 @@ def show_insights(df, analysis):
 def show_quotes(df):
     st.subheader("Verbatim Reactions")
 
-    # Filters
     c1, c2, c3 = st.columns(3)
     with c1:
         filter_sentiment = st.selectbox("Filter by sentiment", ["All", "positive", "negative", "neutral", "mixed"])
@@ -546,12 +711,207 @@ def show_data(df):
     available = [c for c in display_cols if c in df.columns]
     st.dataframe(df[available].sort_values("interest_score", ascending=False), use_container_width=True, height=500)
 
-    # Download
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download Full Results as CSV",
         data=csv,
         file_name=f"reactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+    )
+
+
+# ============================================================
+# DISPLAY - SURVEY
+# ============================================================
+
+def show_survey_overview(df, per_question, questions):
+    st.subheader("Survey Overview")
+
+    col1, col2, col3 = st.columns(3)
+    n_respondents = df["persona_id"].nunique()
+    col1.metric("Respondents", n_respondents)
+    col2.metric("Questions", len(questions))
+    top_sentiment = df["sentiment"].mode().iloc[0] if not df["sentiment"].mode().empty else "N/A"
+    col3.metric("Overall Sentiment", top_sentiment.title())
+
+    st.divider()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        sent_counts = df["sentiment"].value_counts()
+        fig = px.pie(
+            values=sent_counts.values, names=sent_counts.index,
+            title="Overall Sentiment (all answers)",
+            color=sent_counts.index,
+            color_discrete_map=SENTIMENT_COLORS,
+        )
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        all_themes = []
+        for themes_list in df["key_themes"]:
+            if isinstance(themes_list, list):
+                all_themes.extend(themes_list)
+        theme_counts = Counter(all_themes).most_common(12)
+        if theme_counts:
+            theme_df = pd.DataFrame(theme_counts, columns=["Theme", "Mentions"])
+            fig = px.bar(
+                theme_df.iloc[::-1], x="Mentions", y="Theme",
+                orientation="h", title="Top Themes Across All Questions",
+                color_discrete_sequence=["#2d5a87"],
+            )
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Sentiment by question heatmap
+    st.subheader("Sentiment by Question")
+    heatmap_data = []
+    for qnum in range(1, len(questions) + 1):
+        qa = per_question.get(qnum, {})
+        sc = qa.get("sentiment_counts", {})
+        label = f"Q{qnum}: {questions[qnum-1][:80]}"
+        heatmap_data.append({
+            "Question": label,
+            "Positive": sc.get("positive", 0),
+            "Neutral": sc.get("neutral", 0),
+            "Mixed": sc.get("mixed", 0),
+            "Negative": sc.get("negative", 0),
+        })
+    heatmap_df = pd.DataFrame(heatmap_data).set_index("Question")
+    st.dataframe(
+        heatmap_df.style.background_gradient(cmap="RdYlGn", axis=1),
+        use_container_width=True,
+    )
+
+
+def show_per_question_analysis(df, per_question, questions):
+    st.subheader("Per-Question Breakdown")
+
+    for qnum in range(1, len(questions) + 1):
+        qa = per_question.get(qnum, {})
+        q_df = df[df["question_number"] == qnum]
+
+        with st.expander(f"Q{qnum}: {questions[qnum-1]}", expanded=(qnum == 1)):
+            c1, c2 = st.columns(2)
+            with c1:
+                sent_counts = q_df["sentiment"].value_counts()
+                fig = px.pie(
+                    values=sent_counts.values, names=sent_counts.index,
+                    title="Sentiment",
+                    color=sent_counts.index,
+                    color_discrete_map=SENTIMENT_COLORS,
+                )
+                fig.update_traces(textposition="inside", textinfo="percent+label")
+                st.plotly_chart(fig, use_container_width=True)
+
+            with c2:
+                conf_order = ["low", "medium", "high"]
+                conf_counts = q_df["confidence"].value_counts()
+                conf_df = pd.DataFrame({"Confidence": conf_counts.index, "Count": conf_counts.values})
+                conf_df["sort_key"] = conf_df["Confidence"].apply(lambda x: conf_order.index(x) if x in conf_order else 99)
+                conf_df = conf_df.sort_values("sort_key")
+                fig = px.bar(
+                    conf_df, x="Confidence", y="Count",
+                    title="Confidence Level",
+                    color_discrete_sequence=["#8e44ad"],
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Themes
+            if qa.get("top_themes"):
+                themes_df = pd.DataFrame(qa["top_themes"], columns=["Theme", "Count"])
+                fig = px.bar(
+                    themes_df.iloc[::-1], x="Count", y="Theme",
+                    orientation="h", title="Top Themes",
+                    color_discrete_sequence=["#2d5a87"],
+                )
+                fig.update_layout(height=max(300, len(themes_df) * 28))
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Sentiment by age group
+            st.markdown("**Sentiment by Age Group**")
+            age_sent = q_df.groupby(["age_group", "sentiment"], observed=True).size().reset_index(name="count")
+            if not age_sent.empty:
+                fig = px.bar(
+                    age_sent, x="age_group", y="count", color="sentiment",
+                    barmode="group", color_discrete_map=SENTIMENT_COLORS,
+                    labels={"age_group": "Age Group", "count": "Count"},
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Sentiment by income
+            st.markdown("**Sentiment by Income Bracket**")
+            inc_sent = q_df.groupby(["income_bracket", "sentiment"], observed=True).size().reset_index(name="count")
+            if not inc_sent.empty:
+                fig = px.bar(
+                    inc_sent, x="income_bracket", y="count", color="sentiment",
+                    barmode="group", color_discrete_map=SENTIMENT_COLORS,
+                    labels={"income_bracket": "Income Bracket", "count": "Count"},
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+
+def show_survey_responses(df, questions):
+    st.subheader("Individual Responses")
+
+    selected_q = st.selectbox(
+        "Select question",
+        [f"Q{i}: {q}" for i, q in enumerate(questions, 1)],
+        key="survey_q_select",
+    )
+    qnum = int(selected_q.split(":")[0][1:])
+    q_df = df[df["question_number"] == qnum].copy()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        filter_sentiment = st.selectbox("Filter by sentiment", ["All", "positive", "negative", "neutral", "mixed"], key="survey_sent_filter")
+    with c2:
+        filter_confidence = st.selectbox("Filter by confidence", ["All", "high", "medium", "low"], key="survey_conf_filter")
+
+    if filter_sentiment != "All":
+        q_df = q_df[q_df["sentiment"] == filter_sentiment]
+    if filter_confidence != "All":
+        q_df = q_df[q_df["confidence"] == filter_confidence]
+
+    st.caption(f"Showing {len(q_df)} responses")
+
+    for _, row in q_df.head(30).iterrows():
+        sentiment = row.get("sentiment", "neutral")
+        confidence = row.get("confidence", "medium")
+        emoji = {"positive": ":green_circle:", "negative": ":red_circle:", "neutral": ":white_circle:", "mixed": ":orange_circle:"}.get(sentiment, ":white_circle:")
+
+        with st.expander(f"{emoji} **{row['persona_name']}** | Age {row['age']}, {row['province']} | {sentiment} | {confidence} confidence"):
+            st.markdown(f"**Answer:** {row['answer']}")
+
+            themes = row.get("key_themes", [])
+            if isinstance(themes, list) and themes:
+                st.markdown(f"**Themes:** {', '.join(themes)}")
+
+            st.caption(f"{row.get('life_stage', '')} | {row.get('education', '')} | Income: ${row.get('income', 0):,} | {row.get('family_status', '')}")
+
+
+def show_survey_data(df):
+    st.subheader("Raw Data")
+
+    display_df = df.copy()
+    display_df["key_themes"] = display_df["key_themes"].apply(
+        lambda x: "; ".join(x) if isinstance(x, list) else str(x)
+    )
+
+    display_cols = [
+        "question_number", "question_text", "persona_name", "age", "gender",
+        "province", "income", "life_stage", "answer", "sentiment",
+        "confidence", "key_themes",
+    ]
+    available = [c for c in display_cols if c in display_df.columns]
+    st.dataframe(display_df[available], use_container_width=True, height=500)
+
+    csv = display_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download Survey Results as CSV",
+        data=csv,
+        file_name=f"survey_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
     )
 
@@ -563,7 +923,16 @@ def show_data(df):
 def render_sidebar(personas):
     with st.sidebar:
         st.title(":flag-ca: Persona Reactor")
-        st.caption("Test investment ideas against synthetic Canadian investor personas")
+        st.caption("Test ideas and run surveys against synthetic Canadian personas")
+        st.divider()
+
+        mode = st.radio(
+            "Mode",
+            ["Idea Reactor", "Survey"],
+            horizontal=True,
+            help="Idea Reactor tests investment ideas. Survey sends custom questions to the persona panel.",
+        )
+
         st.divider()
 
         sample_size = st.slider(
@@ -577,7 +946,6 @@ def render_sidebar(personas):
         with st.expander("Persona Demographics"):
             st.caption(f"**Total personas available:** {len(personas)}")
 
-            # Quick stats
             ages = [p["age"] for p in personas]
             st.caption(f"**Age range:** {min(ages)}-{max(ages)} (avg {sum(ages)/len(ages):.0f})")
 
@@ -594,18 +962,14 @@ def render_sidebar(personas):
         st.divider()
         st.caption("Powered by Gemini 2.5 Flash")
 
-    return sample_size
+    return sample_size, mode
 
 
 # ============================================================
-# MAIN APP
+# MODE: IDEA REACTOR
 # ============================================================
 
-def main():
-    personas = load_personas()
-    sample_size = render_sidebar(personas)
-
-    # Main content
+def run_reactor_mode(personas, sample_size):
     st.title("Test Your Investment Idea")
     st.markdown("Describe your investment idea below and get reactions from a demographically representative panel of Canadian investors.")
 
@@ -622,12 +986,7 @@ def main():
         if idea.strip():
             st.caption(f"Will test against {sample_size} personas using stratified sampling")
 
-    # Run collection
     if run_button and idea.strip():
-        if API_KEY == "PASTE_YOUR_KEY_HERE":
-            st.error("Please set your Gemini API key in app.py (line 28)")
-            return
-
         sampled = stratified_sample(personas, sample_size)
         st.info(f"Testing against {len(sampled)} personas (stratified sample from {len(personas)})")
 
@@ -637,7 +996,6 @@ def main():
         st.session_state["reactions"] = reactions
         st.session_state["idea"] = idea.strip()
 
-    # Display results
     if "reactions" in st.session_state:
         reactions = st.session_state["reactions"]
         df, analysis = build_analysis(reactions)
@@ -664,6 +1022,88 @@ def main():
             show_quotes(df)
         with tab5:
             show_data(df)
+
+
+# ============================================================
+# MODE: SURVEY
+# ============================================================
+
+def run_survey_mode(personas, sample_size):
+    st.title("Survey Your Persona Panel")
+    st.markdown("Enter custom questions to ask the persona panel. One question per line. Questions can be about anything \u2014 product feedback, policy opinions, lifestyle, financial habits, etc.")
+
+    questions_text = st.text_area(
+        "Survey Questions (one per line)",
+        height=200,
+        placeholder="Example:\nWould you consider switching banks for better digital features?\nHow important is ESG / responsible investing to you?\nWhat financial topic do you wish you understood better?",
+    )
+
+    # Parse questions
+    questions = [q.strip() for q in questions_text.strip().split("\n") if q.strip()]
+
+    if questions:
+        st.caption(f"{len(questions)} question(s) detected:")
+        for i, q in enumerate(questions, 1):
+            st.markdown(f"**Q{i}.** {q}")
+        if len(questions) > 10:
+            st.warning("More than 10 questions may produce longer response times and occasional truncation.")
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        run_button = st.button("Run Survey", type="primary", use_container_width=True, disabled=len(questions) == 0)
+    with col2:
+        if questions:
+            st.caption(f"Will survey {sample_size} personas with {len(questions)} question(s)")
+
+    if run_button and questions:
+        sampled = stratified_sample(personas, sample_size)
+        st.info(f"Surveying {len(sampled)} personas with {len(questions)} questions...")
+
+        with st.spinner("Collecting survey responses..."):
+            responses = collect_survey_responses(sampled, questions)
+
+        st.session_state["survey_responses"] = responses
+        st.session_state["survey_questions"] = questions
+
+    if "survey_responses" in st.session_state and "survey_questions" in st.session_state:
+        responses = st.session_state["survey_responses"]
+        questions = st.session_state["survey_questions"]
+        df, per_question = build_survey_analysis(responses, questions)
+
+        if df is None or df.empty:
+            st.error("No valid survey responses received. Check your API key and try again.")
+            return
+
+        st.divider()
+        st.header("Survey Results")
+        st.caption(f"{df['persona_id'].nunique()} respondents, {len(questions)} questions")
+
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "Overview", "Per-Question Analysis", "Individual Responses", "Raw Data & Export"
+        ])
+
+        with tab1:
+            show_survey_overview(df, per_question, questions)
+        with tab2:
+            show_per_question_analysis(df, per_question, questions)
+        with tab3:
+            show_survey_responses(df, questions)
+        with tab4:
+            show_survey_data(df)
+
+
+# ============================================================
+# MAIN APP
+# ============================================================
+
+def main():
+    personas = load_personas()
+    sample_size, mode = render_sidebar(personas)
+
+    if mode == "Idea Reactor":
+        run_reactor_mode(personas, sample_size)
+    else:
+        run_survey_mode(personas, sample_size)
 
 
 if __name__ == "__main__":
