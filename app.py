@@ -61,6 +61,9 @@ PERSONA:
 
 You are being surveyed. Answer each question honestly and naturally from this persona's perspective. Consider your age, income, education, family situation, values, location, and life experiences.
 
+For multiple-choice questions, you MUST select exactly ONE of the provided options as your answer in the "selected_option" field. Also provide a brief explanation in the "answer" field.
+For open-ended questions, set "selected_option" to null and provide your full answer in the "answer" field.
+
 QUESTIONS:
 {questions_formatted}
 
@@ -69,7 +72,9 @@ Respond ONLY with valid JSON in this exact format (no markdown, no code fences):
   "answers": [
     {{
       "question_number": 1,
-      "answer": "<your natural, in-character answer in 1-3 sentences>",
+      "question_type": "<open_ended|multiple_choice>",
+      "selected_option": "<chosen option text for MC, or null for open-ended>",
+      "answer": "<your natural, in-character answer/explanation in 1-3 sentences>",
       "sentiment": "<positive|neutral|negative|mixed>",
       "confidence": "<low|medium|high>",
       "key_themes": ["<theme1>", "<theme2>"]
@@ -78,6 +83,44 @@ Respond ONLY with valid JSON in this exact format (no markdown, no code fences):
 }}
 
 Include one entry in the "answers" array for each question, in order."""
+
+# Regex: line ending with [opt1, opt2, ...] (at least 2 comma-separated items)
+MC_PATTERN = re.compile(r'^(.+?)\s*\[([^,\]]+(?:,\s*[^,\]]+)+)\]\s*$')
+
+
+def parse_questions(raw_text):
+    """Parse text area input into structured question dicts.
+
+    Lines ending with [option1, option2, ...] (2+ comma-separated items)
+    are multiple-choice. All other non-empty lines are open-ended.
+    """
+    questions = []
+    for line in raw_text.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        match = MC_PATTERN.match(line)
+        if match:
+            text = match.group(1).strip()
+            options = [opt.strip() for opt in match.group(2).split(",")]
+            questions.append({"type": "mc", "text": text, "options": options})
+        else:
+            questions.append({"type": "open", "text": line})
+    return questions
+
+
+def format_questions_for_prompt(questions):
+    """Format structured questions for the LLM prompt."""
+    lines = []
+    for i, q in enumerate(questions, 1):
+        if q["type"] == "mc":
+            option_lines = "\n".join(
+                f"  {chr(97+j)}) {opt}" for j, opt in enumerate(q["options"])
+            )
+            lines.append(f"Q{i}. (Choose ONE) {q['text']}\n{option_lines}")
+        else:
+            lines.append(f"Q{i}. (Open-ended) {q['text']}")
+    return "\n\n".join(lines)
 
 
 # ============================================================
@@ -248,7 +291,7 @@ def collect_reactions(personas, idea):
 # ============================================================
 
 def get_survey_response(client, persona, questions):
-    questions_formatted = "\n".join(f"Q{i}. {q}" for i, q in enumerate(questions, 1))
+    questions_formatted = format_questions_for_prompt(questions)
     prompt = SURVEY_PROMPT.format(
         persona=persona["persona_summary"],
         questions_formatted=questions_formatted,
@@ -380,6 +423,18 @@ def build_survey_analysis(responses, questions):
         for ans in answers:
             qnum = ans.get("question_number", 0)
             if 1 <= qnum <= len(questions):
+                q_def = questions[qnum - 1]
+                selected = ans.get("selected_option")
+
+                # Validate MC selected_option against allowed options
+                if q_def["type"] == "mc" and selected:
+                    matched = None
+                    for opt in q_def["options"]:
+                        if opt.lower().strip() == str(selected).lower().strip():
+                            matched = opt
+                            break
+                    selected = matched if matched else selected
+
                 rows.append({
                     "persona_id": resp["persona_id"],
                     "persona_name": resp["persona_name"],
@@ -396,7 +451,9 @@ def build_survey_analysis(responses, questions):
                     "education": resp["education"],
                     "family_status": resp.get("family_status", ""),
                     "question_number": qnum,
-                    "question_text": questions[qnum - 1],
+                    "question_text": q_def["text"],
+                    "question_type": q_def["type"],
+                    "selected_option": selected if q_def["type"] == "mc" else None,
                     "answer": ans.get("answer", ""),
                     "sentiment": ans.get("sentiment", "neutral"),
                     "confidence": ans.get("confidence", "medium"),
@@ -418,18 +475,36 @@ def build_survey_analysis(responses, questions):
     # Per-question aggregation
     per_question = {}
     for qnum in range(1, len(questions) + 1):
+        q_def = questions[qnum - 1]
         q_df = df[df["question_number"] == qnum]
         all_themes = []
         for themes in q_df["key_themes"]:
             if isinstance(themes, list):
                 all_themes.extend(themes)
-        per_question[qnum] = {
-            "question": questions[qnum - 1],
+
+        pq = {
+            "question": q_def["text"],
+            "question_type": q_def["type"],
             "response_count": len(q_df),
             "sentiment_counts": q_df["sentiment"].value_counts().to_dict(),
             "confidence_counts": q_df["confidence"].value_counts().to_dict(),
             "top_themes": Counter(all_themes).most_common(15),
         }
+
+        if q_def["type"] == "mc":
+            option_counts = {}
+            for opt in q_def["options"]:
+                option_counts[opt] = int((q_df["selected_option"] == opt).sum())
+            known = set(q_def["options"])
+            other_count = int(q_df["selected_option"].apply(
+                lambda x: x not in known if pd.notna(x) else False
+            ).sum())
+            if other_count > 0:
+                option_counts["(Other)"] = other_count
+            pq["option_counts"] = option_counts
+            pq["options"] = q_def["options"]
+
+        per_question[qnum] = pq
 
     return df, per_question
 
@@ -727,10 +802,13 @@ def show_data(df):
 def show_survey_overview(df, per_question, questions):
     st.subheader("Survey Overview")
 
+    n_open = sum(1 for q in questions if q["type"] == "open")
+    n_mc = sum(1 for q in questions if q["type"] == "mc")
+
     col1, col2, col3 = st.columns(3)
     n_respondents = df["persona_id"].nunique()
     col1.metric("Respondents", n_respondents)
-    col2.metric("Questions", len(questions))
+    col2.metric("Questions", f"{len(questions)} ({n_open} open, {n_mc} MC)")
     top_sentiment = df["sentiment"].mode().iloc[0] if not df["sentiment"].mode().empty else "N/A"
     col3.metric("Overall Sentiment", top_sentiment.title())
 
@@ -771,7 +849,8 @@ def show_survey_overview(df, per_question, questions):
     for qnum in range(1, len(questions) + 1):
         qa = per_question.get(qnum, {})
         sc = qa.get("sentiment_counts", {})
-        label = f"Q{qnum}: {questions[qnum-1][:60]}"
+        q_type_tag = "(MC)" if qa.get("question_type") == "mc" else "(Open)"
+        label = f"Q{qnum} {q_type_tag}: {questions[qnum-1]['text'][:55]}"
         q_labels.append(label)
         heatmap_data.append([
             sc.get("positive", 0),
@@ -790,15 +869,87 @@ def show_survey_overview(df, per_question, questions):
     fig.update_layout(height=max(250, len(questions) * 50), yaxis_autorange="reversed")
     st.plotly_chart(fig, use_container_width=True)
 
+    # MC option distribution summary
+    mc_questions = [(qnum, qa) for qnum, qa in per_question.items() if qa.get("question_type") == "mc"]
+    if mc_questions:
+        st.subheader("Multiple-Choice Summary")
+        for qnum, qa in mc_questions:
+            option_counts = qa.get("option_counts", {})
+            if option_counts:
+                opt_df = pd.DataFrame(
+                    list(option_counts.items()), columns=["Option", "Count"]
+                )
+                fig = px.bar(
+                    opt_df, x="Count", y="Option", orientation="h",
+                    title=f"Q{qnum}: {qa['question'][:70]}",
+                    color_discrete_sequence=["#2d5a87"],
+                )
+                fig.update_layout(height=max(200, len(opt_df) * 40))
+                st.plotly_chart(fig, use_container_width=True, key=f"overview_mc_{qnum}")
+
 
 def show_per_question_analysis(df, per_question, questions):
     st.subheader("Per-Question Breakdown")
 
     for qnum in range(1, len(questions) + 1):
         qa = per_question.get(qnum, {})
+        q_def = questions[qnum - 1]
         q_df = df[df["question_number"] == qnum]
+        q_type = qa.get("question_type", "open")
+        type_badge = "Multiple Choice" if q_type == "mc" else "Open-Ended"
 
-        with st.expander(f"Q{qnum}: {questions[qnum-1]}", expanded=(qnum == 1)):
+        with st.expander(f"Q{qnum} ({type_badge}): {q_def['text']}", expanded=(qnum == 1)):
+
+            # === MC PRIMARY: Option Distribution ===
+            if q_type == "mc":
+                option_counts = qa.get("option_counts", {})
+                if option_counts:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        opt_df = pd.DataFrame(
+                            list(option_counts.items()), columns=["Option", "Count"]
+                        )
+                        fig = px.pie(
+                            opt_df, values="Count", names="Option",
+                            title="Option Distribution",
+                        )
+                        fig.update_traces(textposition="inside", textinfo="percent+label")
+                        st.plotly_chart(fig, use_container_width=True, key=f"sq_opt_pie_{qnum}")
+
+                    with c2:
+                        fig = px.bar(
+                            opt_df, x="Option", y="Count",
+                            title="Option Counts",
+                            color_discrete_sequence=["#2d5a87"],
+                        )
+                        st.plotly_chart(fig, use_container_width=True, key=f"sq_opt_bar_{qnum}")
+
+                # Option by age group
+                st.markdown("**Option Selection by Age Group**")
+                age_opt = q_df.groupby(["age_group", "selected_option"], observed=True).size().reset_index(name="count")
+                if not age_opt.empty:
+                    fig = px.bar(
+                        age_opt, x="age_group", y="count", color="selected_option",
+                        barmode="group",
+                        labels={"age_group": "Age Group", "count": "Count", "selected_option": "Option"},
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key=f"sq_opt_age_{qnum}")
+
+                # Option by income bracket
+                st.markdown("**Option Selection by Income Bracket**")
+                inc_opt = q_df.groupby(["income_bracket", "selected_option"], observed=True).size().reset_index(name="count")
+                if not inc_opt.empty:
+                    fig = px.bar(
+                        inc_opt, x="income_bracket", y="count", color="selected_option",
+                        barmode="group",
+                        labels={"income_bracket": "Income Bracket", "count": "Count", "selected_option": "Option"},
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key=f"sq_opt_inc_{qnum}")
+
+                st.markdown("---")
+                st.markdown("**Sentiment & Confidence (from explanations)**")
+
+            # === Sentiment & Confidence (shown for ALL question types) ===
             c1, c2 = st.columns(2)
             with c1:
                 sent_counts = q_df["sentiment"].value_counts()
@@ -835,45 +986,64 @@ def show_per_question_analysis(df, per_question, questions):
                 fig.update_layout(height=max(300, len(themes_df) * 28))
                 st.plotly_chart(fig, use_container_width=True, key=f"sq_themes_{qnum}")
 
-            # Sentiment by age group
-            st.markdown("**Sentiment by Age Group**")
-            age_sent = q_df.groupby(["age_group", "sentiment"], observed=True).size().reset_index(name="count")
-            if not age_sent.empty:
-                fig = px.bar(
-                    age_sent, x="age_group", y="count", color="sentiment",
-                    barmode="group", color_discrete_map=SENTIMENT_COLORS,
-                    labels={"age_group": "Age Group", "count": "Count"},
-                )
-                st.plotly_chart(fig, use_container_width=True, key=f"sq_age_{qnum}")
+            # Sentiment by demographics (for open-ended questions)
+            if q_type == "open":
+                st.markdown("**Sentiment by Age Group**")
+                age_sent = q_df.groupby(["age_group", "sentiment"], observed=True).size().reset_index(name="count")
+                if not age_sent.empty:
+                    fig = px.bar(
+                        age_sent, x="age_group", y="count", color="sentiment",
+                        barmode="group", color_discrete_map=SENTIMENT_COLORS,
+                        labels={"age_group": "Age Group", "count": "Count"},
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key=f"sq_age_{qnum}")
 
-            # Sentiment by income
-            st.markdown("**Sentiment by Income Bracket**")
-            inc_sent = q_df.groupby(["income_bracket", "sentiment"], observed=True).size().reset_index(name="count")
-            if not inc_sent.empty:
-                fig = px.bar(
-                    inc_sent, x="income_bracket", y="count", color="sentiment",
-                    barmode="group", color_discrete_map=SENTIMENT_COLORS,
-                    labels={"income_bracket": "Income Bracket", "count": "Count"},
-                )
-                st.plotly_chart(fig, use_container_width=True, key=f"sq_inc_{qnum}")
+                st.markdown("**Sentiment by Income Bracket**")
+                inc_sent = q_df.groupby(["income_bracket", "sentiment"], observed=True).size().reset_index(name="count")
+                if not inc_sent.empty:
+                    fig = px.bar(
+                        inc_sent, x="income_bracket", y="count", color="sentiment",
+                        barmode="group", color_discrete_map=SENTIMENT_COLORS,
+                        labels={"income_bracket": "Income Bracket", "count": "Count"},
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key=f"sq_inc_{qnum}")
 
 
 def show_survey_responses(df, questions):
     st.subheader("Individual Responses")
 
+    q_labels = []
+    for i, q in enumerate(questions, 1):
+        type_tag = "(MC)" if q["type"] == "mc" else "(Open)"
+        q_labels.append(f"Q{i} {type_tag}: {q['text']}")
+
     selected_q = st.selectbox(
         "Select question",
-        [f"Q{i}: {q}" for i, q in enumerate(questions, 1)],
+        q_labels,
         key="survey_q_select",
     )
-    qnum = int(selected_q.split(":")[0][1:])
+    qnum = int(selected_q.split(":")[0].strip().split()[0][1:])
+    q_def = questions[qnum - 1]
     q_df = df[df["question_number"] == qnum].copy()
 
-    c1, c2 = st.columns(2)
-    with c1:
-        filter_sentiment = st.selectbox("Filter by sentiment", ["All", "positive", "negative", "neutral", "mixed"], key="survey_sent_filter")
-    with c2:
-        filter_confidence = st.selectbox("Filter by confidence", ["All", "high", "medium", "low"], key="survey_conf_filter")
+    # Filters - add option filter for MC questions
+    if q_def["type"] == "mc":
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            filter_sentiment = st.selectbox("Filter by sentiment", ["All", "positive", "negative", "neutral", "mixed"], key="survey_sent_filter")
+        with c2:
+            filter_confidence = st.selectbox("Filter by confidence", ["All", "high", "medium", "low"], key="survey_conf_filter")
+        with c3:
+            options_list = ["All"] + q_def["options"]
+            filter_option = st.selectbox("Filter by selection", options_list, key="survey_opt_filter")
+        if filter_option != "All":
+            q_df = q_df[q_df["selected_option"] == filter_option]
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            filter_sentiment = st.selectbox("Filter by sentiment", ["All", "positive", "negative", "neutral", "mixed"], key="survey_sent_filter")
+        with c2:
+            filter_confidence = st.selectbox("Filter by confidence", ["All", "high", "medium", "low"], key="survey_conf_filter")
 
     if filter_sentiment != "All":
         q_df = q_df[q_df["sentiment"] == filter_sentiment]
@@ -888,7 +1058,11 @@ def show_survey_responses(df, questions):
         emoji = {"positive": ":green_circle:", "negative": ":red_circle:", "neutral": ":white_circle:", "mixed": ":orange_circle:"}.get(sentiment, ":white_circle:")
 
         with st.expander(f"{emoji} **{row['persona_name']}** | Age {row['age']}, {row['province']} | {sentiment} | {confidence} confidence"):
-            st.markdown(f"**Answer:** {row['answer']}")
+            if q_def["type"] == "mc" and pd.notna(row.get("selected_option")):
+                st.markdown(f"**Selected:** :ballot_box_with_check: **{row['selected_option']}**")
+                st.markdown(f"**Explanation:** {row['answer']}")
+            else:
+                st.markdown(f"**Answer:** {row['answer']}")
 
             themes = row.get("key_themes", [])
             if isinstance(themes, list) and themes:
@@ -906,8 +1080,8 @@ def show_survey_data(df):
     )
 
     display_cols = [
-        "question_number", "question_text", "persona_name", "age", "gender",
-        "province", "income", "life_stage", "answer", "sentiment",
+        "question_number", "question_type", "question_text", "persona_name", "age", "gender",
+        "province", "income", "life_stage", "selected_option", "answer", "sentiment",
         "confidence", "key_themes",
     ]
     available = [c for c in display_cols if c in display_df.columns]
@@ -1036,21 +1210,28 @@ def run_reactor_mode(personas, sample_size):
 
 def run_survey_mode(personas, sample_size):
     st.title("Survey Your Persona Panel")
-    st.markdown("Enter custom questions to ask the persona panel. One question per line. Questions can be about anything \u2014 product feedback, policy opinions, lifestyle, financial habits, etc.")
+    st.markdown("Enter custom questions to ask the persona panel. One question per line. "
+                "For multiple-choice, add options in brackets: `Which do you prefer? [A, B, C]`")
 
     questions_text = st.text_area(
         "Survey Questions (one per line)",
         height=200,
-        placeholder="Example:\nWould you consider switching banks for better digital features?\nHow important is ESG / responsible investing to you?\nWhat financial topic do you wish you understood better?",
+        placeholder="Example:\nWould you consider switching banks for better digital features?\nWhich investment type do you prefer? [Stocks, Bonds, Real Estate, Crypto]\nHow important is ESG / responsible investing to you?\nHow often do you check your portfolio? [Daily, Weekly, Monthly, Rarely]",
     )
 
-    # Parse questions
-    questions = [q.strip() for q in questions_text.strip().split("\n") if q.strip()]
+    # Parse questions into structured format
+    questions = parse_questions(questions_text) if questions_text.strip() else []
 
     if questions:
-        st.caption(f"{len(questions)} question(s) detected:")
+        n_open = sum(1 for q in questions if q["type"] == "open")
+        n_mc = sum(1 for q in questions if q["type"] == "mc")
+        st.caption(f"{len(questions)} question(s) detected ({n_open} open-ended, {n_mc} multiple-choice):")
         for i, q in enumerate(questions, 1):
-            st.markdown(f"**Q{i}.** {q}")
+            if q["type"] == "mc":
+                options_str = " | ".join(q["options"])
+                st.markdown(f"**Q{i}.** *(MC)* {q['text']}  \n&nbsp;&nbsp;&nbsp;&nbsp;Options: {options_str}")
+            else:
+                st.markdown(f"**Q{i}.** *(Open)* {q['text']}")
         if len(questions) > 10:
             st.warning("More than 10 questions may produce longer response times and occasional truncation.")
 
@@ -1074,6 +1255,9 @@ def run_survey_mode(personas, sample_size):
     if "survey_responses" in st.session_state and "survey_questions" in st.session_state:
         responses = st.session_state["survey_responses"]
         questions = st.session_state["survey_questions"]
+        # Legacy guard: convert old string format to structured dicts
+        if questions and isinstance(questions[0], str):
+            questions = [{"type": "open", "text": q} for q in questions]
         df, per_question = build_survey_analysis(responses, questions)
 
         if df is None or df.empty:
