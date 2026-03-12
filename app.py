@@ -27,7 +27,7 @@ from google.genai import types
 # API key loaded from .streamlit/secrets.toml (local) or Streamlit Cloud secrets
 API_KEY = st.secrets["GEMINI_API_KEY"]
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.1-flash-lite-preview"
 MAX_WORKERS = 10
 PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "personas.json")
 
@@ -1140,7 +1140,7 @@ def render_sidebar(personas):
                 st.caption(f"  {eth}: {count} ({count/len(personas)*100:.0f}%)")
 
         st.divider()
-        st.caption("Powered by Gemini 2.5 Flash")
+        st.caption("Powered by Gemini 3.1 Flash-Lite")
 
     return sample_size, mode
 
