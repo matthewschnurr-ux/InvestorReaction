@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Canadian Persona Reactor & Survey Tool - Streamlit Web App
-Test investment ideas and run custom surveys against 1,000 synthetic Canadian personas.
+Synthetic Persona Reactor - Streamlit Web App
+Test ideas, run surveys and do A/B testing against investor and advisor personas.
 """
 
 import streamlit as st
@@ -184,8 +184,8 @@ def format_questions_for_prompt(questions):
 # ============================================================
 
 st.set_page_config(
-    page_title="Persona Reactor",
-    page_icon=":flag-ca:",
+    page_title="Synthetic Persona Reactor",
+    page_icon="🧪",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -1855,8 +1855,8 @@ def show_advisor_survey_data(df, key_suffix=""):
 
 def render_sidebar(consumer_personas, advisor_personas):
     with st.sidebar:
-        st.title(":flag-ca: Persona Reactor")
-        st.caption("Test ideas and run surveys against synthetic Canadian personas")
+        st.title("Synthetic Persona Reactor")
+        st.caption("Test ideas, run surveys and do A/B testing against investor and advisor personas")
         st.divider()
 
         panel = st.radio(
