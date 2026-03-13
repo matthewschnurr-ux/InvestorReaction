@@ -30,6 +30,7 @@ API_KEY = st.secrets["GEMINI_API_KEY"]
 MODEL_NAME = "gemini-3.1-flash-lite-preview"
 MAX_WORKERS = 10
 PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "personas.json")
+ADVISOR_PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "advisor_personas.json")
 
 REACTION_PROMPT = """You are roleplaying as this Canadian investor persona. Stay fully in character. Think and respond as this specific person would, given their background, financial situation, knowledge level, and life circumstances.
 
@@ -60,6 +61,61 @@ PERSONA:
 {persona}
 
 You are being surveyed. Answer each question honestly and naturally from this persona's perspective. Consider your age, income, education, family situation, values, location, and life experiences.
+
+For multiple-choice questions, you MUST select exactly ONE of the provided options as your answer in the "selected_option" field. Also provide a brief explanation in the "answer" field.
+For open-ended questions, set "selected_option" to null and provide your full answer in the "answer" field.
+
+QUESTIONS:
+{questions_formatted}
+
+Respond ONLY with valid JSON in this exact format (no markdown, no code fences):
+{{
+  "answers": [
+    {{
+      "question_number": 1,
+      "question_type": "<open_ended|multiple_choice>",
+      "selected_option": "<chosen option text for MC, or null for open-ended>",
+      "answer": "<your natural, in-character answer/explanation in 1-3 sentences>",
+      "sentiment": "<positive|neutral|negative|mixed>",
+      "confidence": "<low|medium|high>",
+      "key_themes": ["<theme1>", "<theme2>"]
+    }}
+  ]
+}}
+
+Include one entry in the "answers" array for each question, in order."""
+
+# ---------- ADVISOR-SPECIFIC PROMPTS ----------
+
+ADVISOR_REACTION_PROMPT = """You are roleplaying as this Canadian financial advisor persona. Stay fully in character. Think and respond as this specific advisor would, given their professional background, designations, client base, practice focus, and years of experience.
+
+PERSONA:
+{persona}
+
+React to the following investment idea, product, or concept FROM A PROFESSIONAL PERSPECTIVE. Consider whether you would recommend this to your clients, how it fits various client profiles, regulatory considerations, and practical implementation in your practice.
+
+IDEA:
+{idea}
+
+Respond ONLY with valid JSON in this exact format (no markdown, no code fences):
+{{
+  "interest_score": <integer 1-10>,
+  "sentiment": "<positive|neutral|negative|mixed>",
+  "gut_reaction": "<1-2 sentence first-person professional reaction>",
+  "key_concerns": ["<concern1>", "<concern2>"],
+  "appeal_factors": ["<what appeals to you professionally about this>"],
+  "would_recommend": <true or false>,
+  "client_suitability": "<unsuitable|niche|moderate|broad>",
+  "what_would_help": "<what would make you more likely to recommend this to clients>",
+  "verbatim_quote": "<2-3 sentences as if talking to a colleague about this>"
+}}"""
+
+ADVISOR_SURVEY_PROMPT = """You are roleplaying as this Canadian financial advisor persona. Stay fully in character. Think and respond as this specific advisor would, given their professional background, designations, client base, practice focus, and experience.
+
+PERSONA:
+{persona}
+
+You are being surveyed about your professional opinions and practices. Answer each question honestly and naturally from this advisor's professional perspective. Consider your experience, client base, firm type, designations, and practice focus.
 
 For multiple-choice questions, you MUST select exactly ONE of the provided options as your answer in the "selected_option" field. Also provide a brief explanation in the "answer" field.
 For open-ended questions, set "selected_option" to null and provide your full answer in the "answer" field.
@@ -164,6 +220,12 @@ def load_personas():
         return json.load(f)
 
 
+@st.cache_data
+def load_advisor_personas():
+    with open(ADVISOR_PERSONAS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def stratified_sample(personas, n):
     rng = random.Random(42)
     if n >= len(personas):
@@ -173,6 +235,32 @@ def stratified_sample(personas, n):
         age_group = "18-34" if p["age"] < 35 else ("35-54" if p["age"] < 55 else "55+")
         income_group = "low" if p["household_income"] < 60000 else ("mid" if p["household_income"] < 120000 else "high")
         key = (age_group, income_group, p["risk_tolerance"])
+        strata.setdefault(key, []).append(p)
+    sampled = []
+    total = len(personas)
+    for members in strata.values():
+        stratum_n = max(1, round(len(members) / total * n))
+        sampled.extend(rng.sample(members, min(stratum_n, len(members))))
+    if len(sampled) > n:
+        sampled = rng.sample(sampled, n)
+    elif len(sampled) < n:
+        remaining = [p for p in personas if p not in sampled]
+        sampled.extend(rng.sample(remaining, min(n - len(sampled), len(remaining))))
+    return sampled[:n]
+
+
+def stratified_sample_advisors(personas, n):
+    """Stratified sample for advisor personas by years_group x book_size_group x firm_type."""
+    rng = random.Random(42)
+    if n >= len(personas):
+        return personas
+    strata = {}
+    for p in personas:
+        yrs = p["years_in_business"]
+        years_group = "junior" if yrs <= 5 else ("mid" if yrs <= 15 else "senior")
+        aum = p["book_size_aum"]
+        book_group = "small" if aum < 50_000_000 else ("medium" if aum < 150_000_000 else "large")
+        key = (years_group, book_group, p["firm_type"])
         strata.setdefault(key, []).append(p)
     sampled = []
     total = len(personas)
@@ -206,6 +294,29 @@ def attach_persona_metadata(result, persona):
     return result
 
 
+def attach_advisor_metadata(result, persona):
+    """Attach advisor persona metadata to an API result."""
+    result["persona_id"] = persona["id"]
+    result["persona_name"] = f"{persona['first_name']} {persona['last_name']}"
+    result["age"] = persona["age"]
+    result["gender"] = persona["gender"]
+    result["province"] = persona["province"]
+    result["city"] = persona["city"]
+    result["firm_type"] = persona["firm_type"]
+    result["years_in_business"] = persona["years_in_business"]
+    result["designations"] = ", ".join(persona["designations"]) if isinstance(persona["designations"], list) else persona["designations"]
+    result["book_size_aum"] = persona["book_size_aum"]
+    result["num_clients"] = persona["num_clients"]
+    result["practice_focus"] = persona["practice_focus"]
+    result["compensation_model"] = persona["compensation_model"]
+    result["personal_income"] = persona["personal_income"]
+    result["business_maturity"] = persona["business_maturity"]
+    result["client_demographics"] = persona["client_demographics"]
+    result["education"] = persona["education"]
+    result["family_status"] = persona.get("family_status", "")
+    return result
+
+
 def make_error_result(persona, error_msg):
     """Create an error result dict for a persona."""
     return {
@@ -219,8 +330,10 @@ def make_error_result(persona, error_msg):
 # API CALLS - REACTOR
 # ============================================================
 
-def get_reaction(client, persona, idea):
-    prompt = REACTION_PROMPT.format(persona=persona["persona_summary"], idea=idea)
+def get_reaction(client, persona, idea, is_advisor=False):
+    prompt_template = ADVISOR_REACTION_PROMPT if is_advisor else REACTION_PROMPT
+    attach_fn = attach_advisor_metadata if is_advisor else attach_persona_metadata
+    prompt = prompt_template.format(persona=persona["persona_summary"], idea=idea)
     for attempt in range(3):
         try:
             response = client.models.generate_content(
@@ -238,7 +351,7 @@ def get_reaction(client, persona, idea):
                 text = re.sub(r"^```(?:json)?\s*", "", text)
                 text = re.sub(r"\s*```$", "", text)
             reaction = json.loads(text)
-            return attach_persona_metadata(reaction, persona)
+            return attach_fn(reaction, persona)
         except json.JSONDecodeError:
             if attempt < 2:
                 time.sleep(1)
@@ -254,7 +367,7 @@ def get_reaction(client, persona, idea):
             return make_error_result(persona, str(e)[:100])
 
 
-def collect_reactions(personas, idea):
+def collect_reactions(personas, idea, is_advisor=False):
     client = genai.Client(api_key=API_KEY)
     total = len(personas)
     reactions = []
@@ -267,7 +380,7 @@ def collect_reactions(personas, idea):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_persona = {}
         for persona in personas:
-            future = executor.submit(get_reaction, client, persona, idea)
+            future = executor.submit(get_reaction, client, persona, idea, is_advisor)
             future_to_persona[future] = persona
             time.sleep(delay)
 
@@ -290,9 +403,11 @@ def collect_reactions(personas, idea):
 # API CALLS - SURVEY
 # ============================================================
 
-def get_survey_response(client, persona, questions):
+def get_survey_response(client, persona, questions, is_advisor=False):
     questions_formatted = format_questions_for_prompt(questions)
-    prompt = SURVEY_PROMPT.format(
+    prompt_template = ADVISOR_SURVEY_PROMPT if is_advisor else SURVEY_PROMPT
+    attach_fn = attach_advisor_metadata if is_advisor else attach_persona_metadata
+    prompt = prompt_template.format(
         persona=persona["persona_summary"],
         questions_formatted=questions_formatted,
     )
@@ -313,7 +428,7 @@ def get_survey_response(client, persona, questions):
                 text = re.sub(r"^```(?:json)?\s*", "", text)
                 text = re.sub(r"\s*```$", "", text)
             result = json.loads(text)
-            return attach_persona_metadata(result, persona)
+            return attach_fn(result, persona)
         except json.JSONDecodeError:
             if attempt < 2:
                 time.sleep(1)
@@ -329,7 +444,7 @@ def get_survey_response(client, persona, questions):
             return make_error_result(persona, str(e)[:100])
 
 
-def collect_survey_responses(personas, questions):
+def collect_survey_responses(personas, questions, is_advisor=False):
     client = genai.Client(api_key=API_KEY)
     total = len(personas)
     responses = []
@@ -342,7 +457,7 @@ def collect_survey_responses(personas, questions):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_persona = {}
         for persona in personas:
-            future = executor.submit(get_survey_response, client, persona, questions)
+            future = executor.submit(get_survey_response, client, persona, questions, is_advisor)
             future_to_persona[future] = persona
             time.sleep(delay)
 
@@ -499,6 +614,157 @@ def build_survey_analysis(responses, questions):
             other_count = int(q_df["selected_option"].apply(
                 lambda x: x not in known if pd.notna(x) else False
             ).sum())
+            if other_count > 0:
+                option_counts["(Other)"] = other_count
+            pq["option_counts"] = option_counts
+            pq["options"] = q_def["options"]
+
+        per_question[qnum] = pq
+
+    return df, per_question
+
+
+# ============================================================
+# ANALYSIS - ADVISOR REACTOR
+# ============================================================
+
+def build_advisor_analysis(reactions):
+    """Build analysis DataFrame and aggregation for advisor reactions."""
+    valid = [r for r in reactions if "error" not in r]
+    if not valid:
+        return None, None
+
+    df = pd.DataFrame(valid)
+
+    df["interest_score"] = pd.to_numeric(df["interest_score"], errors="coerce")
+    df["would_recommend"] = df.get("would_recommend", pd.Series([False]*len(df))).astype(bool)
+    df["personal_income"] = pd.to_numeric(df.get("personal_income", 0), errors="coerce")
+    df["years_in_business"] = pd.to_numeric(df.get("years_in_business", 0), errors="coerce")
+    df["book_size_aum"] = pd.to_numeric(df.get("book_size_aum", 0), errors="coerce")
+    df["age"] = pd.to_numeric(df["age"], errors="coerce")
+
+    df["age_group"] = pd.cut(df["age"], bins=[0, 34, 54, 100], labels=["Under 35", "35-54", "55+"])
+    df["years_group"] = pd.cut(df["years_in_business"], bins=[-1, 5, 15, 100], labels=["Junior (0-5yr)", "Mid (6-15yr)", "Senior (16+yr)"])
+    df["book_size_group"] = pd.cut(
+        df["book_size_aum"], bins=[0, 50e6, 150e6, float("inf")],
+        labels=["Under $50M", "$50M-$150M", "$150M+"]
+    )
+    df["income_bracket"] = pd.cut(
+        df["personal_income"], bins=[0, 100000, 250000, float("inf")],
+        labels=["Under $100K", "$100K-$250K", "$250K+"]
+    )
+
+    all_concerns = []
+    all_appeals = []
+    all_helps = []
+    for _, row in df.iterrows():
+        concerns = row.get("key_concerns", [])
+        if isinstance(concerns, list):
+            all_concerns.extend(concerns)
+        appeals = row.get("appeal_factors", [])
+        if isinstance(appeals, list):
+            all_appeals.extend(appeals)
+        wh = row.get("what_would_help", "")
+        if isinstance(wh, str) and wh:
+            all_helps.append(wh)
+
+    analysis = {
+        "top_concerns": Counter(all_concerns).most_common(12),
+        "top_appeals": Counter(all_appeals).most_common(12),
+        "what_would_help": all_helps,
+    }
+
+    return df, analysis
+
+
+def build_advisor_survey_analysis(responses, questions):
+    """Build survey analysis DataFrame for advisor personas."""
+    valid = [r for r in responses if "error" not in r]
+    if not valid:
+        return None, None
+
+    rows = []
+    for resp in valid:
+        answers = resp.get("answers", [])
+        for ans in answers:
+            qnum = ans.get("question_number", 0)
+            if 1 <= qnum <= len(questions):
+                q_def = questions[qnum - 1]
+                selected = ans.get("selected_option")
+                if q_def["type"] == "mc" and selected:
+                    matched = None
+                    for opt in q_def["options"]:
+                        if opt.lower().strip() == str(selected).lower().strip():
+                            matched = opt
+                            break
+                    selected = matched if matched else selected
+
+                rows.append({
+                    "persona_id": resp["persona_id"],
+                    "persona_name": resp["persona_name"],
+                    "age": resp.get("age", 0),
+                    "gender": resp.get("gender", ""),
+                    "province": resp.get("province", ""),
+                    "city": resp.get("city", ""),
+                    "firm_type": resp.get("firm_type", ""),
+                    "years_in_business": resp.get("years_in_business", 0),
+                    "designations": resp.get("designations", ""),
+                    "book_size_aum": resp.get("book_size_aum", 0),
+                    "practice_focus": resp.get("practice_focus", ""),
+                    "compensation_model": resp.get("compensation_model", ""),
+                    "personal_income": resp.get("personal_income", 0),
+                    "business_maturity": resp.get("business_maturity", ""),
+                    "client_demographics": resp.get("client_demographics", ""),
+                    "education": resp.get("education", ""),
+                    "family_status": resp.get("family_status", ""),
+                    "question_number": qnum,
+                    "question_text": q_def["text"],
+                    "question_type": q_def["type"],
+                    "selected_option": selected if q_def["type"] == "mc" else None,
+                    "answer": ans.get("answer", ""),
+                    "sentiment": ans.get("sentiment", "neutral"),
+                    "confidence": ans.get("confidence", "medium"),
+                    "key_themes": ans.get("key_themes", []),
+                })
+
+    if not rows:
+        return None, None
+
+    df = pd.DataFrame(rows)
+    df["age"] = pd.to_numeric(df["age"], errors="coerce")
+    df["personal_income"] = pd.to_numeric(df["personal_income"], errors="coerce")
+    df["years_in_business"] = pd.to_numeric(df["years_in_business"], errors="coerce")
+    df["book_size_aum"] = pd.to_numeric(df["book_size_aum"], errors="coerce")
+    df["years_group"] = pd.cut(df["years_in_business"], bins=[-1, 5, 15, 100], labels=["Junior (0-5yr)", "Mid (6-15yr)", "Senior (16+yr)"])
+    df["book_size_group"] = pd.cut(
+        df["book_size_aum"], bins=[0, 50e6, 150e6, float("inf")],
+        labels=["Under $50M", "$50M-$150M", "$150M+"]
+    )
+
+    per_question = {}
+    for qnum in range(1, len(questions) + 1):
+        q_def = questions[qnum - 1]
+        q_df = df[df["question_number"] == qnum]
+        all_themes = []
+        for themes in q_df["key_themes"]:
+            if isinstance(themes, list):
+                all_themes.extend(themes)
+
+        pq = {
+            "question": q_def["text"],
+            "question_type": q_def["type"],
+            "response_count": len(q_df),
+            "sentiment_counts": q_df["sentiment"].value_counts().to_dict(),
+            "confidence_counts": q_df["confidence"].value_counts().to_dict(),
+            "top_themes": Counter(all_themes).most_common(15),
+        }
+
+        if q_def["type"] == "mc":
+            option_counts = {}
+            for opt in q_def["options"]:
+                option_counts[opt] = int((q_df["selected_option"] == opt).sum())
+            known = set(q_def["options"])
+            other_count = int((~q_df["selected_option"].isin(known) & q_df["selected_option"].notna()).sum())
             if other_count > 0:
                 option_counts["(Other)"] = other_count
             pq["option_counts"] = option_counts
@@ -1098,13 +1364,508 @@ def show_survey_data(df):
 
 
 # ============================================================
+# DISPLAY - ADVISOR REACTOR
+# ============================================================
+
+SUITABILITY_ORDER = ["unsuitable", "niche", "moderate", "broad"]
+SUITABILITY_COLORS = {"unsuitable": "#e74c3c", "niche": "#f39c12", "moderate": "#3498db", "broad": "#2ecc71"}
+
+
+def show_advisor_overview(df, key_suffix=""):
+    """Overview metrics for advisor reactions."""
+    st.subheader("Key Metrics")
+    col1, col2, col3, col4 = st.columns(4)
+    avg_score = df["interest_score"].mean()
+    recommend_pct = df["would_recommend"].mean() * 100 if "would_recommend" in df.columns else 0
+    top_sentiment = df["sentiment"].mode().iloc[0] if len(df) > 0 else "N/A"
+    median_score = df["interest_score"].median()
+
+    col1.metric("Avg Interest Score", f"{avg_score:.1f}/10")
+    col2.metric("Would Recommend", f"{recommend_pct:.0f}%")
+    col3.metric("Top Sentiment", top_sentiment.capitalize())
+    col4.metric("Median Score", f"{median_score:.1f}/10")
+
+    st.divider()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.histogram(df, x="interest_score", nbins=10, title="Interest Score Distribution",
+                           color_discrete_sequence=["#2d5a87"])
+        fig.update_layout(xaxis_title="Score", yaxis_title="Count", bargap=0.1)
+        st.plotly_chart(fig, use_container_width=True, key=f"adv_score_hist{key_suffix}")
+
+    with c2:
+        sent_counts = df["sentiment"].value_counts()
+        colors = [SENTIMENT_COLORS.get(s, "#95a5a6") for s in sent_counts.index]
+        fig = go.Figure(data=[go.Pie(labels=sent_counts.index, values=sent_counts.values,
+                                      marker=dict(colors=colors), hole=0.4)])
+        fig.update_layout(title="Sentiment Distribution")
+        st.plotly_chart(fig, use_container_width=True, key=f"adv_sent_pie{key_suffix}")
+
+    # Client suitability bar chart
+    if "client_suitability" in df.columns:
+        suit_counts = df["client_suitability"].str.lower().value_counts()
+        ordered = [s for s in SUITABILITY_ORDER if s in suit_counts.index]
+        colors = [SUITABILITY_COLORS.get(s, "#95a5a6") for s in ordered]
+        fig = go.Figure(data=[go.Bar(
+            x=ordered, y=[suit_counts[s] for s in ordered],
+            marker_color=colors,
+        )])
+        fig.update_layout(title="Client Suitability Assessment", xaxis_title="Suitability", yaxis_title="Count")
+        st.plotly_chart(fig, use_container_width=True, key=f"adv_suit_bar{key_suffix}")
+
+
+def show_advisor_demographics(df, key_suffix=""):
+    """Demographic breakdowns for advisor reactions."""
+    st.subheader("Professional Breakdowns")
+
+    # By Years in Business
+    c1, c2 = st.columns(2)
+    with c1:
+        if "years_group" in df.columns:
+            group_data = df.groupby("years_group", observed=True).agg(
+                avg_score=("interest_score", "mean"),
+                recommend_pct=("would_recommend", lambda x: x.mean() * 100),
+                count=("interest_score", "size"),
+            ).reset_index()
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=group_data["years_group"], y=group_data["avg_score"],
+                                  name="Avg Score", marker_color="#2d5a87"))
+            fig.update_layout(title="Interest by Experience Level", yaxis_title="Avg Score")
+            st.plotly_chart(fig, use_container_width=True, key=f"adv_yrs_score{key_suffix}")
+
+    with c2:
+        if "years_group" in df.columns:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=group_data["years_group"], y=group_data["recommend_pct"],
+                                  name="% Recommend", marker_color="#27ae60"))
+            fig.update_layout(title="% Would Recommend by Experience", yaxis_title="% Recommend")
+            st.plotly_chart(fig, use_container_width=True, key=f"adv_yrs_rec{key_suffix}")
+
+    # By Firm Type
+    c1, c2 = st.columns(2)
+    with c1:
+        if "firm_type" in df.columns:
+            firm_data = df.groupby("firm_type").agg(
+                avg_score=("interest_score", "mean"),
+                count=("interest_score", "size"),
+            ).sort_values("avg_score", ascending=True).reset_index()
+            fig = px.bar(firm_data, y="firm_type", x="avg_score", orientation="h",
+                         title="Interest by Firm Type", color_discrete_sequence=["#2d5a87"])
+            fig.update_layout(xaxis_title="Avg Score", yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True, key=f"adv_firm_score{key_suffix}")
+
+    with c2:
+        if "book_size_group" in df.columns:
+            book_data = df.groupby("book_size_group", observed=True).agg(
+                avg_score=("interest_score", "mean"),
+                recommend_pct=("would_recommend", lambda x: x.mean() * 100),
+                count=("interest_score", "size"),
+            ).reset_index()
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=book_data["book_size_group"], y=book_data["avg_score"],
+                                  name="Avg Score", marker_color="#8e44ad"))
+            fig.update_layout(title="Interest by Book Size", yaxis_title="Avg Score")
+            st.plotly_chart(fig, use_container_width=True, key=f"adv_book_score{key_suffix}")
+
+    # By Province and Practice Focus
+    c1, c2 = st.columns(2)
+    with c1:
+        if "province" in df.columns:
+            prov_data = df.groupby("province").agg(
+                avg_score=("interest_score", "mean"),
+                count=("interest_score", "size"),
+            ).sort_values("count", ascending=False).head(6).sort_values("avg_score", ascending=True).reset_index()
+            fig = px.bar(prov_data, y="province", x="avg_score", orientation="h",
+                         title="Interest by Province (Top 6)", color_discrete_sequence=["#16a085"])
+            fig.update_layout(xaxis_title="Avg Score", yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True, key=f"adv_prov_score{key_suffix}")
+
+    with c2:
+        if "practice_focus" in df.columns:
+            focus_data = df.groupby("practice_focus").agg(
+                avg_score=("interest_score", "mean"),
+                count=("interest_score", "size"),
+            ).sort_values("avg_score", ascending=True).reset_index()
+            fig = px.bar(focus_data, y="practice_focus", x="avg_score", orientation="h",
+                         title="Interest by Practice Focus", color_discrete_sequence=["#e67e22"])
+            fig.update_layout(xaxis_title="Avg Score", yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True, key=f"adv_focus_score{key_suffix}")
+
+
+def show_advisor_quotes(df, key_suffix=""):
+    """Show advisor verbatim quotes with filters."""
+    st.subheader("Advisor Verbatim Reactions")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        filter_sentiment = st.selectbox("Filter by Sentiment", ["All"] + list(SENTIMENT_COLORS.keys()), key=f"adv_quote_sent{key_suffix}")
+    with c2:
+        filter_recommend = st.selectbox("Filter by Recommendation", ["All", "Would Recommend", "Would Not Recommend"], key=f"adv_quote_rec{key_suffix}")
+    with c3:
+        sort_by = st.selectbox("Sort by", ["Interest Score (High-Low)", "Interest Score (Low-High)", "Years in Business"], key=f"adv_quote_sort{key_suffix}")
+
+    filtered = df.copy()
+    if filter_sentiment != "All":
+        filtered = filtered[filtered["sentiment"] == filter_sentiment]
+    if filter_recommend == "Would Recommend" and "would_recommend" in filtered.columns:
+        filtered = filtered[filtered["would_recommend"] == True]
+    elif filter_recommend == "Would Not Recommend" and "would_recommend" in filtered.columns:
+        filtered = filtered[filtered["would_recommend"] == False]
+
+    if sort_by == "Interest Score (High-Low)":
+        filtered = filtered.sort_values("interest_score", ascending=False)
+    elif sort_by == "Interest Score (Low-High)":
+        filtered = filtered.sort_values("interest_score", ascending=True)
+    elif "years_in_business" in filtered.columns:
+        filtered = filtered.sort_values("years_in_business", ascending=False)
+
+    for _, row in filtered.head(20).iterrows():
+        score = row.get("interest_score", "?")
+        sentiment = row.get("sentiment", "neutral")
+        emoji = {"positive": "thumbsup", "negative": "thumbsdown", "mixed": "thinking_face", "neutral": "neutral_face"}.get(sentiment, "neutral_face")
+        recommend = "Yes" if row.get("would_recommend", False) else "No"
+        suitability = row.get("client_suitability", "N/A")
+
+        with st.expander(f":{emoji}: **{row.get('persona_name', 'Unknown')}** — Score: {score}/10 | Recommend: {recommend} | Suitability: {suitability}"):
+            firm = row.get("firm_type", "")
+            desig = row.get("designations", "")
+            yrs = row.get("years_in_business", "")
+            aum = row.get("book_size_aum", 0)
+            aum_str = f"${aum/1e6:.0f}M" if aum and aum > 0 else "N/A"
+            focus = row.get("practice_focus", "")
+            st.caption(f"{firm} | {desig} | {yrs} years | Book: {aum_str} | {focus}")
+
+            st.markdown(f"**Gut reaction:** {row.get('gut_reaction', 'N/A')}")
+            st.markdown(f"**Verbatim:** \"{row.get('verbatim_quote', 'N/A')}\"")
+            concerns = row.get("key_concerns", [])
+            if isinstance(concerns, list) and concerns:
+                st.markdown(f"**Concerns:** {', '.join(concerns)}")
+            appeals = row.get("appeal_factors", [])
+            if isinstance(appeals, list) and appeals:
+                st.markdown(f"**Appeals:** {', '.join(appeals)}")
+            st.markdown(f"**What would help:** {row.get('what_would_help', 'N/A')}")
+
+
+def show_advisor_data(df, key_suffix=""):
+    """Show raw advisor data table."""
+    st.subheader("Raw Data")
+    display_cols = [
+        "persona_name", "age", "province", "firm_type", "designations",
+        "years_in_business", "book_size_aum", "practice_focus",
+        "interest_score", "sentiment", "would_recommend",
+        "client_suitability", "gut_reaction",
+    ]
+    available = [c for c in display_cols if c in df.columns]
+    st.dataframe(df[available], use_container_width=True, height=500, key=f"adv_data_table{key_suffix}")
+
+    csv = df[available].to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download as CSV",
+        data=csv,
+        file_name=f"advisor_reactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        key=f"adv_download_csv{key_suffix}",
+    )
+
+
+def show_advisor_ab_comparison(df_a, df_b, analysis_a, analysis_b, idea_a, idea_b, key_suffix=""):
+    """Head-to-head comparison for advisor A/B test."""
+    st.subheader("Head-to-Head Comparison")
+
+    # Key metrics
+    col_a, col_vs, col_b = st.columns([2, 1, 2])
+    avg_a = df_a["interest_score"].mean()
+    avg_b = df_b["interest_score"].mean()
+    rec_a = df_a["would_recommend"].mean() * 100 if "would_recommend" in df_a.columns else 0
+    rec_b = df_b["would_recommend"].mean() * 100 if "would_recommend" in df_b.columns else 0
+    sent_a = df_a["sentiment"].mode().iloc[0] if len(df_a) > 0 else "N/A"
+    sent_b = df_b["sentiment"].mode().iloc[0] if len(df_b) > 0 else "N/A"
+    med_a = df_a["interest_score"].median()
+    med_b = df_b["interest_score"].median()
+
+    with col_a:
+        st.markdown(f"### Variant A")
+        st.metric("Avg Score", f"{avg_a:.1f}", delta=f"{avg_a - avg_b:+.1f}" if avg_a != avg_b else None)
+        st.metric("% Recommend", f"{rec_a:.0f}%", delta=f"{rec_a - rec_b:+.0f}%" if rec_a != rec_b else None)
+        st.metric("Top Sentiment", sent_a.capitalize())
+        st.metric("Median Score", f"{med_a:.1f}")
+    with col_vs:
+        st.markdown("### vs")
+    with col_b:
+        st.markdown(f"### Variant B")
+        st.metric("Avg Score", f"{avg_b:.1f}", delta=f"{avg_b - avg_a:+.1f}" if avg_a != avg_b else None)
+        st.metric("% Recommend", f"{rec_b:.0f}%", delta=f"{rec_b - rec_a:+.0f}%" if rec_a != rec_b else None)
+        st.metric("Top Sentiment", sent_b.capitalize())
+        st.metric("Median Score", f"{med_b:.1f}")
+
+    st.divider()
+
+    # Score distribution overlay
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=df_a["interest_score"], name="Variant A", opacity=0.6, marker_color="#2d5a87", nbinsx=10))
+    fig.add_trace(go.Histogram(x=df_b["interest_score"], name="Variant B", opacity=0.6, marker_color="#e74c3c", nbinsx=10))
+    fig.update_layout(title="Interest Score Distribution", barmode="overlay", xaxis_title="Score", yaxis_title="Count")
+    st.plotly_chart(fig, use_container_width=True, key=f"adv_ab_hist{key_suffix}")
+
+    # Side-by-side sentiment
+    c1, c2 = st.columns(2)
+    for col, dfl, label in [(c1, df_a, "Variant A"), (c2, df_b, "Variant B")]:
+        with col:
+            sent = dfl["sentiment"].value_counts()
+            colors = [SENTIMENT_COLORS.get(s, "#95a5a6") for s in sent.index]
+            fig = go.Figure(data=[go.Pie(labels=sent.index, values=sent.values,
+                                          marker=dict(colors=colors), hole=0.4)])
+            fig.update_layout(title=f"Sentiment - {label}")
+            st.plotly_chart(fig, use_container_width=True, key=f"adv_ab_sent_{label}{key_suffix}")
+
+    # By years group
+    if "years_group" in df_a.columns and "years_group" in df_b.columns:
+        grp_a = df_a.groupby("years_group", observed=True)["would_recommend"].mean() * 100
+        grp_b = df_b.groupby("years_group", observed=True)["would_recommend"].mean() * 100
+        cats = sorted(set(grp_a.index) | set(grp_b.index), key=str)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=cats, y=[grp_a.get(c, 0) for c in cats], name="Variant A", marker_color="#2d5a87"))
+        fig.add_trace(go.Bar(x=cats, y=[grp_b.get(c, 0) for c in cats], name="Variant B", marker_color="#e74c3c"))
+        fig.update_layout(title="% Would Recommend by Experience Level", barmode="group", yaxis_title="% Recommend")
+        st.plotly_chart(fig, use_container_width=True, key=f"adv_ab_yrs{key_suffix}")
+
+    # By firm type
+    if "firm_type" in df_a.columns and "firm_type" in df_b.columns:
+        grp_a = df_a.groupby("firm_type")["would_recommend"].mean() * 100
+        grp_b = df_b.groupby("firm_type")["would_recommend"].mean() * 100
+        cats = sorted(set(grp_a.index) | set(grp_b.index))
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=cats, y=[grp_a.get(c, 0) for c in cats], name="Variant A", marker_color="#2d5a87"))
+        fig.add_trace(go.Bar(x=cats, y=[grp_b.get(c, 0) for c in cats], name="Variant B", marker_color="#e74c3c"))
+        fig.update_layout(title="% Would Recommend by Firm Type", barmode="group", yaxis_title="% Recommend", xaxis_tickangle=-30)
+        st.plotly_chart(fig, use_container_width=True, key=f"adv_ab_firm{key_suffix}")
+
+    # By book size
+    if "book_size_group" in df_a.columns and "book_size_group" in df_b.columns:
+        grp_a = df_a.groupby("book_size_group", observed=True)["would_recommend"].mean() * 100
+        grp_b = df_b.groupby("book_size_group", observed=True)["would_recommend"].mean() * 100
+        cats = sorted(set(grp_a.index) | set(grp_b.index), key=str)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=cats, y=[grp_a.get(c, 0) for c in cats], name="Variant A", marker_color="#2d5a87"))
+        fig.add_trace(go.Bar(x=cats, y=[grp_b.get(c, 0) for c in cats], name="Variant B", marker_color="#e74c3c"))
+        fig.update_layout(title="% Would Recommend by Book Size", barmode="group", yaxis_title="% Recommend")
+        st.plotly_chart(fig, use_container_width=True, key=f"adv_ab_book{key_suffix}")
+
+    # Concerns & Appeals comparison
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Top Concerns**")
+        for label_name, analysis, color in [("A", analysis_a, "#2d5a87"), ("B", analysis_b, "#e74c3c")]:
+            concerns = analysis.get("top_concerns", [])[:6]
+            if concerns:
+                items, counts = zip(*concerns)
+                fig = px.bar(x=list(counts), y=list(items), orientation="h",
+                             title=f"Variant {label_name}", color_discrete_sequence=[color])
+                fig.update_layout(xaxis_title="Count", yaxis_title="", height=250)
+                st.plotly_chart(fig, use_container_width=True, key=f"adv_ab_concerns_{label_name}{key_suffix}")
+    with c2:
+        st.markdown("**Top Appeals**")
+        for label_name, analysis, color in [("A", analysis_a, "#2d5a87"), ("B", analysis_b, "#e74c3c")]:
+            appeals = analysis.get("top_appeals", [])[:6]
+            if appeals:
+                items, counts = zip(*appeals)
+                fig = px.bar(x=list(counts), y=list(items), orientation="h",
+                             title=f"Variant {label_name}", color_discrete_sequence=[color])
+                fig.update_layout(xaxis_title="Count", yaxis_title="", height=250)
+                st.plotly_chart(fig, use_container_width=True, key=f"adv_ab_appeals_{label_name}{key_suffix}")
+
+    # Statistical significance
+    st.divider()
+    st.subheader("Statistical Summary")
+    diff_pct = abs(avg_a - avg_b) / max(avg_a, avg_b) * 100 if max(avg_a, avg_b) > 0 else 0
+    winner = "A" if avg_a > avg_b else ("B" if avg_b > avg_a else "Tie")
+    st.markdown(f"Variant A scored **{avg_a:.2f}** vs Variant B's **{avg_b:.2f}** — a **{diff_pct:.1f}%** difference. "
+                f"{'Variant ' + winner + ' leads.' if winner != 'Tie' else 'It is a tie.'}")
+    try:
+        from scipy.stats import ttest_rel
+        merged = df_a[["persona_id", "interest_score"]].merge(
+            df_b[["persona_id", "interest_score"]], on="persona_id", suffixes=("_a", "_b")
+        )
+        if len(merged) > 1:
+            t_stat, p_value = ttest_rel(merged["interest_score_a"], merged["interest_score_b"])
+            sig = "statistically significant" if p_value < 0.05 else "not statistically significant"
+            st.markdown(f"Paired t-test: t={t_stat:.3f}, p={p_value:.4f} ({sig} at p<0.05, n={len(merged)} paired observations)")
+    except ImportError:
+        st.caption(f"Sample size: {len(df_a)} advisors per variant. Install scipy for statistical significance testing.")
+
+
+def show_advisor_survey_overview(df, per_question, key_suffix=""):
+    """Survey overview for advisor responses."""
+    st.subheader("Survey Overview")
+    total_responses = df["persona_id"].nunique()
+    num_questions = len(per_question)
+    st.markdown(f"**{total_responses}** advisors responded to **{num_questions}** question{'s' if num_questions > 1 else ''}")
+
+    # MC summary
+    mc_questions = {k: v for k, v in per_question.items() if v.get("question_type") == "mc"}
+    if mc_questions:
+        st.markdown("#### Multiple Choice Summary")
+        for qnum, pq in sorted(mc_questions.items()):
+            oc = pq.get("option_counts", {})
+            if oc:
+                top_option = max(oc, key=oc.get)
+                top_pct = oc[top_option] / sum(oc.values()) * 100 if sum(oc.values()) > 0 else 0
+                st.markdown(f"**Q{qnum}.** {pq['question']}")
+                st.markdown(f"  Top answer: **{top_option}** ({top_pct:.0f}%)")
+
+    # Sentiment heatmap
+    if num_questions > 1:
+        heatmap_data = []
+        q_labels = []
+        sentiments = ["positive", "neutral", "negative", "mixed"]
+        for qnum in sorted(per_question.keys()):
+            pq = per_question[qnum]
+            q_type = "MC" if pq.get("question_type") == "mc" else "Open"
+            q_labels.append(f"Q{qnum} [{q_type}]: {pq['question'][:40]}...")
+            counts = pq.get("sentiment_counts", {})
+            total = sum(counts.values()) or 1
+            heatmap_data.append([counts.get(s, 0) / total * 100 for s in sentiments])
+
+        fig = go.Figure(data=go.Heatmap(
+            z=heatmap_data, x=sentiments, y=q_labels,
+            colorscale="RdYlGn", text=[[f"{v:.0f}%" for v in row] for row in heatmap_data],
+            texttemplate="%{text}", hovertemplate="Q: %{y}<br>Sentiment: %{x}<br>%{text}<extra></extra>",
+        ))
+        fig.update_layout(title="Sentiment Heatmap by Question", height=max(300, 50 * num_questions))
+        st.plotly_chart(fig, use_container_width=True, key=f"adv_survey_heatmap{key_suffix}")
+
+
+def show_advisor_per_question(df, per_question, key_suffix=""):
+    """Per-question analysis for advisor survey responses."""
+    st.subheader("Per-Question Analysis")
+    for qnum in sorted(per_question.keys()):
+        pq = per_question[qnum]
+        q_type = pq.get("question_type", "open")
+        st.markdown(f"### Q{qnum}: {pq['question']}")
+        q_df = df[df["question_number"] == qnum]
+
+        if q_type == "mc" and "option_counts" in pq:
+            c1, c2 = st.columns(2)
+            with c1:
+                oc = pq["option_counts"]
+                fig = go.Figure(data=[go.Pie(labels=list(oc.keys()), values=list(oc.values()), hole=0.4)])
+                fig.update_layout(title="Option Distribution")
+                st.plotly_chart(fig, use_container_width=True, key=f"adv_sq_pie_{qnum}{key_suffix}")
+            with c2:
+                if "firm_type" in q_df.columns:
+                    ct = pd.crosstab(q_df["firm_type"], q_df["selected_option"])
+                    fig = px.bar(ct, barmode="group", title="Options by Firm Type")
+                    fig.update_layout(xaxis_title="Firm Type", yaxis_title="Count", xaxis_tickangle=-30)
+                    st.plotly_chart(fig, use_container_width=True, key=f"adv_sq_firm_{qnum}{key_suffix}")
+
+            # By years group
+            if "years_group" in q_df.columns:
+                ct = pd.crosstab(q_df["years_group"], q_df["selected_option"])
+                fig = px.bar(ct, barmode="group", title="Options by Experience Level")
+                fig.update_layout(xaxis_title="Experience", yaxis_title="Count")
+                st.plotly_chart(fig, use_container_width=True, key=f"adv_sq_yrs_{qnum}{key_suffix}")
+        else:
+            # Open-ended: sentiment and confidence
+            c1, c2 = st.columns(2)
+            with c1:
+                sent = pq.get("sentiment_counts", {})
+                if sent:
+                    colors = [SENTIMENT_COLORS.get(s, "#95a5a6") for s in sent.keys()]
+                    fig = go.Figure(data=[go.Pie(labels=list(sent.keys()), values=list(sent.values()),
+                                                  marker=dict(colors=colors), hole=0.4)])
+                    fig.update_layout(title="Sentiment")
+                    st.plotly_chart(fig, use_container_width=True, key=f"adv_sq_sent_{qnum}{key_suffix}")
+            with c2:
+                conf = pq.get("confidence_counts", {})
+                if conf:
+                    fig = go.Figure(data=[go.Pie(labels=list(conf.keys()), values=list(conf.values()), hole=0.4)])
+                    fig.update_layout(title="Confidence")
+                    st.plotly_chart(fig, use_container_width=True, key=f"adv_sq_conf_{qnum}{key_suffix}")
+
+        # Top themes
+        themes = pq.get("top_themes", [])[:8]
+        if themes:
+            items, counts = zip(*themes)
+            fig = px.bar(x=list(counts), y=list(items), orientation="h", title="Top Themes",
+                         color_discrete_sequence=["#2d5a87"])
+            fig.update_layout(xaxis_title="Mentions", yaxis_title="", height=300)
+            st.plotly_chart(fig, use_container_width=True, key=f"adv_sq_themes_{qnum}{key_suffix}")
+
+        st.divider()
+
+
+def show_advisor_survey_responses(df, per_question, key_suffix=""):
+    """Individual advisor survey responses."""
+    st.subheader("Individual Responses")
+    q_options = [f"Q{qnum}: {pq['question'][:50]}" for qnum, pq in sorted(per_question.items())]
+    selected_q = st.selectbox("Select question", q_options, key=f"adv_surv_q_sel{key_suffix}")
+    qnum = int(selected_q.split(":")[0][1:])
+    q_df = df[df["question_number"] == qnum].copy()
+    pq = per_question[qnum]
+
+    # Filter for MC
+    if pq.get("question_type") == "mc" and "option_counts" in pq:
+        opts = ["All"] + pq.get("options", [])
+        sel_opt = st.selectbox("Filter by option", opts, key=f"adv_surv_opt_sel{key_suffix}")
+        if sel_opt != "All":
+            q_df = q_df[q_df["selected_option"] == sel_opt]
+
+    for _, row in q_df.head(30).iterrows():
+        sentiment = row.get("sentiment", "neutral")
+        emoji = {"positive": "thumbsup", "negative": "thumbsdown", "mixed": "thinking_face", "neutral": "neutral_face"}.get(sentiment, "neutral_face")
+        selected = row.get("selected_option", "")
+        opt_display = f" | Selected: **{selected}**" if selected else ""
+        with st.expander(f":{emoji}: **{row.get('persona_name', 'Unknown')}**{opt_display}"):
+            firm = row.get("firm_type", "")
+            desig = row.get("designations", "")
+            yrs = row.get("years_in_business", "")
+            focus = row.get("practice_focus", "")
+            st.caption(f"{firm} | {desig} | {yrs} years | {focus}")
+            st.markdown(row.get("answer", "No answer"))
+            themes = row.get("key_themes", [])
+            if isinstance(themes, list) and themes:
+                st.caption(f"Themes: {', '.join(themes)}")
+
+
+def show_advisor_survey_data(df, key_suffix=""):
+    """Raw advisor survey data table."""
+    st.subheader("Raw Survey Data")
+    display_cols = [
+        "persona_name", "firm_type", "designations", "years_in_business",
+        "practice_focus", "question_number", "question_text", "question_type",
+        "selected_option", "answer", "sentiment", "confidence",
+    ]
+    available = [c for c in display_cols if c in df.columns]
+    display_df = df[available].copy()
+    st.dataframe(display_df, use_container_width=True, height=500, key=f"adv_survey_data_tbl{key_suffix}")
+
+    csv = display_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download Advisor Survey Results as CSV",
+        data=csv,
+        file_name=f"advisor_survey_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        key=f"adv_survey_download{key_suffix}",
+    )
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 
-def render_sidebar(personas):
+def render_sidebar(consumer_personas, advisor_personas):
     with st.sidebar:
         st.title(":flag-ca: Persona Reactor")
         st.caption("Test ideas and run surveys against synthetic Canadian personas")
+        st.divider()
+
+        panel = st.radio(
+            "Panel",
+            ["Canadians as a Whole", "Financial Advisors"],
+            horizontal=True,
+            help="Choose which persona panel to test against.",
+        )
+
         st.divider()
 
         mode = st.radio(
@@ -1116,6 +1877,8 @@ def render_sidebar(personas):
 
         st.divider()
 
+        personas = consumer_personas if panel == "Canadians as a Whole" else advisor_personas
+
         sample_size = st.slider(
             "Sample Size",
             min_value=10, max_value=len(personas), value=50, step=10,
@@ -1124,62 +1887,87 @@ def render_sidebar(personas):
 
         st.divider()
 
-        with st.expander("Persona Demographics"):
-            st.caption(f"**Total personas available:** {len(personas)}")
-
-            ages = [p["age"] for p in personas]
-            st.caption(f"**Age range:** {min(ages)}-{max(ages)} (avg {sum(ages)/len(ages):.0f})")
-
-            provinces = Counter(p["province"] for p in personas)
-            st.caption("**Top provinces:**")
-            for prov, count in provinces.most_common(5):
-                st.caption(f"  {prov}: {count} ({count/len(personas)*100:.0f}%)")
-
-            ethnicities = Counter(p["ethnicity"] for p in personas)
-            st.caption("**Ethnicities:**")
-            for eth, count in ethnicities.most_common(6):
-                st.caption(f"  {eth}: {count} ({count/len(personas)*100:.0f}%)")
+        with st.expander("Panel Demographics"):
+            if panel == "Canadians as a Whole":
+                st.caption(f"**Total personas available:** {len(personas)}")
+                ages = [p["age"] for p in personas]
+                st.caption(f"**Age range:** {min(ages)}-{max(ages)} (avg {sum(ages)/len(ages):.0f})")
+                provinces = Counter(p["province"] for p in personas)
+                st.caption("**Top provinces:**")
+                for prov, count in provinces.most_common(5):
+                    st.caption(f"  {prov}: {count} ({count/len(personas)*100:.0f}%)")
+                ethnicities = Counter(p["ethnicity"] for p in personas)
+                st.caption("**Ethnicities:**")
+                for eth, count in ethnicities.most_common(6):
+                    st.caption(f"  {eth}: {count} ({count/len(personas)*100:.0f}%)")
+            else:
+                st.caption(f"**Total advisors available:** {len(personas)}")
+                ages = [p["age"] for p in personas]
+                st.caption(f"**Age range:** {min(ages)}-{max(ages)} (avg {sum(ages)/len(ages):.0f})")
+                firms = Counter(p["firm_type"] for p in personas)
+                st.caption("**Firm types:**")
+                for firm, count in firms.most_common(6):
+                    st.caption(f"  {firm}: {count} ({count/len(personas)*100:.0f}%)")
+                focuses = Counter(p["practice_focus"] for p in personas)
+                st.caption("**Practice focus:**")
+                for focus, count in focuses.most_common(5):
+                    st.caption(f"  {focus}: {count} ({count/len(personas)*100:.0f}%)")
+                maturity = Counter(p["business_maturity"] for p in personas)
+                st.caption("**Business maturity:**")
+                for mat, count in maturity.most_common():
+                    st.caption(f"  {mat}: {count} ({count/len(personas)*100:.0f}%)")
 
         st.divider()
         st.caption("Powered by Gemini 3.1 Flash-Lite")
 
-    return sample_size, mode
+    return sample_size, mode, panel, personas
 
 
 # ============================================================
 # MODE: IDEA REACTOR
 # ============================================================
 
-def run_reactor_mode(personas, sample_size):
-    st.title("Test Your Investment Idea")
-    st.markdown("Describe your investment idea below and get reactions from a demographically representative panel of Canadian investors.")
+def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consumer"):
+    if is_advisor:
+        st.title("Test Your Idea with Financial Advisors")
+        st.markdown("Describe your idea below and get professional reactions from a panel of Canadian financial advisors.")
+        idea_label = "Idea / Product / Concept"
+        placeholder = "Example: A new alternative investment platform offering private credit and real estate debt funds with quarterly liquidity, targeting accredited investors with $100K+ minimums..."
+    else:
+        st.title("Test Your Investment Idea")
+        st.markdown("Describe your investment idea below and get reactions from a demographically representative panel of Canadian investors.")
+        idea_label = "Investment Idea"
+        placeholder = "Example: A mobile app that lets Canadians invest spare change from everyday purchases into diversified ETF portfolios, with automatic TFSA contribution tracking and a built-in financial literacy program..."
 
-    idea = st.text_area(
-        "Investment Idea",
-        height=150,
-        placeholder="Example: A mobile app that lets Canadians invest spare change from everyday purchases into diversified ETF portfolios, with automatic TFSA contribution tracking and a built-in financial literacy program...",
-    )
+    idea = st.text_area(idea_label, height=150, placeholder=placeholder)
 
     col1, col2 = st.columns([1, 4])
     with col1:
         run_button = st.button("Test This Idea", type="primary", use_container_width=True, disabled=not idea.strip())
     with col2:
         if idea.strip():
-            st.caption(f"Will test against {sample_size} personas using stratified sampling")
+            panel_label = "advisors" if is_advisor else "personas"
+            st.caption(f"Will test against {sample_size} {panel_label} using stratified sampling")
+
+    reactions_key = f"{panel_key}_reactions"
+    idea_key = f"{panel_key}_idea"
 
     if run_button and idea.strip():
-        sampled = stratified_sample(personas, sample_size)
-        st.info(f"Testing against {len(sampled)} personas (stratified sample from {len(personas)})")
+        sample_fn = stratified_sample_advisors if is_advisor else stratified_sample
+        sampled = sample_fn(personas, sample_size)
+        panel_label = "advisors" if is_advisor else "personas"
+        st.info(f"Testing against {len(sampled)} {panel_label} (stratified sample from {len(personas)})")
 
         with st.spinner("Collecting reactions..."):
-            reactions = collect_reactions(sampled, idea.strip())
+            reactions = collect_reactions(sampled, idea.strip(), is_advisor=is_advisor)
 
-        st.session_state["reactions"] = reactions
-        st.session_state["idea"] = idea.strip()
+        st.session_state[reactions_key] = reactions
+        st.session_state[idea_key] = idea.strip()
 
-    if "reactions" in st.session_state:
-        reactions = st.session_state["reactions"]
-        df, analysis = build_analysis(reactions)
+    if reactions_key in st.session_state:
+        reactions = st.session_state[reactions_key]
+        build_fn = build_advisor_analysis if is_advisor else build_analysis
+        df, analysis = build_fn(reactions)
 
         if df is None or df.empty:
             st.error("No valid reactions received. Check your API key and try again.")
@@ -1187,22 +1975,35 @@ def run_reactor_mode(personas, sample_size):
 
         st.divider()
         st.header("Results")
-        st.caption(f"Idea: *{st.session_state.get('idea', '')[:150]}...*" if len(st.session_state.get("idea", "")) > 150 else f"Idea: *{st.session_state.get('idea', '')}*")
+        idea_text = st.session_state.get(idea_key, "")
+        st.caption(f"Idea: *{idea_text[:150]}...*" if len(idea_text) > 150 else f"Idea: *{idea_text}*")
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "Overview", "Demographics", "Insights", "Verbatim Quotes", "Raw Data"
         ])
 
-        with tab1:
-            show_overview(df)
-        with tab2:
-            show_demographics(df)
-        with tab3:
-            show_insights(df, analysis)
-        with tab4:
-            show_quotes(df)
-        with tab5:
-            show_data(df)
+        if is_advisor:
+            with tab1:
+                show_advisor_overview(df)
+            with tab2:
+                show_advisor_demographics(df)
+            with tab3:
+                show_insights(df, analysis)
+            with tab4:
+                show_advisor_quotes(df)
+            with tab5:
+                show_advisor_data(df)
+        else:
+            with tab1:
+                show_overview(df)
+            with tab2:
+                show_demographics(df)
+            with tab3:
+                show_insights(df, analysis)
+            with tab4:
+                show_quotes(df)
+            with tab5:
+                show_data(df)
 
 
 # ============================================================
@@ -1378,25 +2179,24 @@ def show_ab_comparison(df_a, df_b, analysis_a, analysis_b, idea_a, idea_b):
         st.info(f"**{winner_label}** scored higher by {abs(diff):.1f} points ({pct_diff:.0f}%) across {n} personas.")
 
 
-def run_ab_test_mode(personas, sample_size):
+def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consumer"):
     st.title("A/B Test")
-    st.markdown("Compare two ideas or two ways of messaging the same idea. "
-                "Both variants are tested against the **same** persona sample for a fair comparison.")
+    panel_label = "advisors" if is_advisor else "personas"
+    st.markdown(f"Compare two ideas or two ways of messaging the same idea. "
+                f"Both variants are tested against the **same** {panel_label} sample for a fair comparison.")
 
     c1, c2 = st.columns(2)
     with c1:
         idea_a = st.text_area(
-            "Variant A",
-            height=150,
-            placeholder="Example: A mobile app that rounds up purchases and invests the spare change into diversified ETF portfolios...",
-            key="ab_idea_a_input",
+            "Variant A", height=150,
+            placeholder="Enter the first variant of your idea...",
+            key=f"{panel_key}_ab_idea_a_input",
         )
     with c2:
         idea_b = st.text_area(
-            "Variant B",
-            height=150,
-            placeholder="Example: An AI-powered investment advisor that creates personalized portfolios based on your spending habits...",
-            key="ab_idea_b_input",
+            "Variant B", height=150,
+            placeholder="Enter the second variant of your idea...",
+            key=f"{panel_key}_ab_idea_b_input",
         )
 
     both_filled = idea_a.strip() and idea_b.strip()
@@ -1406,31 +2206,38 @@ def run_ab_test_mode(personas, sample_size):
         run_button = st.button("Run A/B Test", type="primary", use_container_width=True, disabled=not both_filled)
     with col2:
         if both_filled:
-            st.caption(f"Will test both variants against the same {sample_size} personas")
+            st.caption(f"Will test both variants against the same {sample_size} {panel_label}")
+
+    rxa_key = f"{panel_key}_ab_reactions_a"
+    rxb_key = f"{panel_key}_ab_reactions_b"
+    ida_key = f"{panel_key}_ab_idea_a"
+    idb_key = f"{panel_key}_ab_idea_b"
 
     if run_button and both_filled:
-        sampled = stratified_sample(personas, sample_size)
-        st.info(f"Testing both variants against {len(sampled)} personas...")
+        sample_fn = stratified_sample_advisors if is_advisor else stratified_sample
+        sampled = sample_fn(personas, sample_size)
+        st.info(f"Testing both variants against {len(sampled)} {panel_label}...")
 
         st.markdown("**Testing Variant A...**")
-        reactions_a = collect_reactions(sampled, idea_a.strip())
+        reactions_a = collect_reactions(sampled, idea_a.strip(), is_advisor=is_advisor)
 
         st.markdown("**Testing Variant B...**")
-        reactions_b = collect_reactions(sampled, idea_b.strip())
+        reactions_b = collect_reactions(sampled, idea_b.strip(), is_advisor=is_advisor)
 
-        st.session_state["ab_reactions_a"] = reactions_a
-        st.session_state["ab_reactions_b"] = reactions_b
-        st.session_state["ab_idea_a"] = idea_a.strip()
-        st.session_state["ab_idea_b"] = idea_b.strip()
+        st.session_state[rxa_key] = reactions_a
+        st.session_state[rxb_key] = reactions_b
+        st.session_state[ida_key] = idea_a.strip()
+        st.session_state[idb_key] = idea_b.strip()
 
-    if "ab_reactions_a" in st.session_state and "ab_reactions_b" in st.session_state:
-        reactions_a = st.session_state["ab_reactions_a"]
-        reactions_b = st.session_state["ab_reactions_b"]
-        idea_a_text = st.session_state.get("ab_idea_a", "Variant A")
-        idea_b_text = st.session_state.get("ab_idea_b", "Variant B")
+    if rxa_key in st.session_state and rxb_key in st.session_state:
+        reactions_a = st.session_state[rxa_key]
+        reactions_b = st.session_state[rxb_key]
+        idea_a_text = st.session_state.get(ida_key, "Variant A")
+        idea_b_text = st.session_state.get(idb_key, "Variant B")
 
-        df_a, analysis_a = build_analysis(reactions_a)
-        df_b, analysis_b = build_analysis(reactions_b)
+        build_fn = build_advisor_analysis if is_advisor else build_analysis
+        df_a, analysis_a = build_fn(reactions_a)
+        df_b, analysis_b = build_fn(reactions_b)
 
         if (df_a is None or df_a.empty) and (df_b is None or df_b.empty):
             st.error("No valid reactions received for either variant. Check your API key and try again.")
@@ -1443,29 +2250,46 @@ def run_ab_test_mode(personas, sample_size):
 
         with tab1:
             if df_a is not None and df_b is not None and not df_a.empty and not df_b.empty:
-                show_ab_comparison(df_a, df_b, analysis_a, analysis_b, idea_a_text, idea_b_text)
+                if is_advisor:
+                    show_advisor_ab_comparison(df_a, df_b, analysis_a, analysis_b, idea_a_text, idea_b_text)
+                else:
+                    show_ab_comparison(df_a, df_b, analysis_a, analysis_b, idea_a_text, idea_b_text)
             else:
                 st.warning("One variant had no valid reactions. Cannot show comparison.")
 
         with tab2:
             if df_a is not None and not df_a.empty:
                 st.caption(f"Idea: *{idea_a_text[:150]}*")
-                show_overview(df_a)
-                show_demographics(df_a)
-                show_insights(df_a, analysis_a)
-                show_quotes(df_a, key_suffix="_ab_a")
-                show_data(df_a, key_suffix="_ab_a")
+                if is_advisor:
+                    show_advisor_overview(df_a, key_suffix="_ab_a")
+                    show_advisor_demographics(df_a, key_suffix="_ab_a")
+                    show_insights(df_a, analysis_a)
+                    show_advisor_quotes(df_a, key_suffix="_ab_a")
+                    show_advisor_data(df_a, key_suffix="_ab_a")
+                else:
+                    show_overview(df_a)
+                    show_demographics(df_a)
+                    show_insights(df_a, analysis_a)
+                    show_quotes(df_a, key_suffix="_ab_a")
+                    show_data(df_a, key_suffix="_ab_a")
             else:
                 st.warning("No valid reactions for Variant A.")
 
         with tab3:
             if df_b is not None and not df_b.empty:
                 st.caption(f"Idea: *{idea_b_text[:150]}*")
-                show_overview(df_b)
-                show_demographics(df_b)
-                show_insights(df_b, analysis_b)
-                show_quotes(df_b, key_suffix="_ab_b")
-                show_data(df_b, key_suffix="_ab_b")
+                if is_advisor:
+                    show_advisor_overview(df_b, key_suffix="_ab_b")
+                    show_advisor_demographics(df_b, key_suffix="_ab_b")
+                    show_insights(df_b, analysis_b)
+                    show_advisor_quotes(df_b, key_suffix="_ab_b")
+                    show_advisor_data(df_b, key_suffix="_ab_b")
+                else:
+                    show_overview(df_b)
+                    show_demographics(df_b)
+                    show_insights(df_b, analysis_b)
+                    show_quotes(df_b, key_suffix="_ab_b")
+                    show_data(df_b, key_suffix="_ab_b")
             else:
                 st.warning("No valid reactions for Variant B.")
 
@@ -1474,18 +2298,30 @@ def run_ab_test_mode(personas, sample_size):
 # MODE: SURVEY
 # ============================================================
 
-def run_survey_mode(personas, sample_size):
-    st.title("Survey Your Persona Panel")
-    st.markdown("Enter custom questions to ask the persona panel. One question per line. "
-                "For multiple-choice, add options in brackets: `Which do you prefer? [A, B, C]`")
+def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer"):
+    if is_advisor:
+        st.title("Survey Your Advisor Panel")
+        st.markdown("Enter custom questions to ask the financial advisor panel. One question per line. "
+                    "For multiple-choice, add options in brackets: `Which do you prefer? [A, B, C]`")
+        placeholder_text = ("Example:\nWhat is the biggest challenge in your practice right now?\n"
+                            "Which asset class do you expect to grow most in the next 5 years? [Equities, Fixed Income, Alternatives, Real Estate, Crypto]\n"
+                            "How do you communicate with clients during market downturns?\n"
+                            "What is your preferred fee model? [Fee-only, Fee-based hybrid, Commission-based]")
+    else:
+        st.title("Survey Your Persona Panel")
+        st.markdown("Enter custom questions to ask the persona panel. One question per line. "
+                    "For multiple-choice, add options in brackets: `Which do you prefer? [A, B, C]`")
+        placeholder_text = ("Example:\nWould you consider switching banks for better digital features?\n"
+                            "Which investment type do you prefer? [Stocks, Bonds, Real Estate, Crypto]\n"
+                            "How important is ESG / responsible investing to you?\n"
+                            "How often do you check your portfolio? [Daily, Weekly, Monthly, Rarely]")
 
     questions_text = st.text_area(
-        "Survey Questions (one per line)",
-        height=200,
-        placeholder="Example:\nWould you consider switching banks for better digital features?\nWhich investment type do you prefer? [Stocks, Bonds, Real Estate, Crypto]\nHow important is ESG / responsible investing to you?\nHow often do you check your portfolio? [Daily, Weekly, Monthly, Rarely]",
+        "Survey Questions (one per line)", height=200,
+        placeholder=placeholder_text,
+        key=f"{panel_key}_survey_questions_input",
     )
 
-    # Parse questions into structured format
     questions = parse_questions(questions_text) if questions_text.strip() else []
 
     if questions:
@@ -1501,30 +2337,37 @@ def run_survey_mode(personas, sample_size):
         if len(questions) > 10:
             st.warning("More than 10 questions may produce longer response times and occasional truncation.")
 
+    panel_label = "advisors" if is_advisor else "personas"
     col1, col2 = st.columns([1, 4])
     with col1:
         run_button = st.button("Run Survey", type="primary", use_container_width=True, disabled=len(questions) == 0)
     with col2:
         if questions:
-            st.caption(f"Will survey {sample_size} personas with {len(questions)} question(s)")
+            st.caption(f"Will survey {sample_size} {panel_label} with {len(questions)} question(s)")
+
+    resp_key = f"{panel_key}_survey_responses"
+    q_key = f"{panel_key}_survey_questions"
 
     if run_button and questions:
-        sampled = stratified_sample(personas, sample_size)
-        st.info(f"Surveying {len(sampled)} personas with {len(questions)} questions...")
+        sample_fn = stratified_sample_advisors if is_advisor else stratified_sample
+        sampled = sample_fn(personas, sample_size)
+        st.info(f"Surveying {len(sampled)} {panel_label} with {len(questions)} questions...")
 
         with st.spinner("Collecting survey responses..."):
-            responses = collect_survey_responses(sampled, questions)
+            responses = collect_survey_responses(sampled, questions, is_advisor=is_advisor)
 
-        st.session_state["survey_responses"] = responses
-        st.session_state["survey_questions"] = questions
+        st.session_state[resp_key] = responses
+        st.session_state[q_key] = questions
 
-    if "survey_responses" in st.session_state and "survey_questions" in st.session_state:
-        responses = st.session_state["survey_responses"]
-        questions = st.session_state["survey_questions"]
+    if resp_key in st.session_state and q_key in st.session_state:
+        responses = st.session_state[resp_key]
+        questions = st.session_state[q_key]
         # Legacy guard: convert old string format to structured dicts
         if questions and isinstance(questions[0], str):
             questions = [{"type": "open", "text": q} for q in questions]
-        df, per_question = build_survey_analysis(responses, questions)
+
+        build_survey_fn = build_advisor_survey_analysis if is_advisor else build_survey_analysis
+        df, per_question = build_survey_fn(responses, questions)
 
         if df is None or df.empty:
             st.error("No valid survey responses received. Check your API key and try again.")
@@ -1538,14 +2381,24 @@ def run_survey_mode(personas, sample_size):
             "Overview", "Per-Question Analysis", "Individual Responses", "Raw Data & Export"
         ])
 
-        with tab1:
-            show_survey_overview(df, per_question, questions)
-        with tab2:
-            show_per_question_analysis(df, per_question, questions)
-        with tab3:
-            show_survey_responses(df, questions)
-        with tab4:
-            show_survey_data(df)
+        if is_advisor:
+            with tab1:
+                show_advisor_survey_overview(df, per_question)
+            with tab2:
+                show_advisor_per_question(df, per_question)
+            with tab3:
+                show_advisor_survey_responses(df, per_question)
+            with tab4:
+                show_advisor_survey_data(df)
+        else:
+            with tab1:
+                show_survey_overview(df, per_question, questions)
+            with tab2:
+                show_per_question_analysis(df, per_question, questions)
+            with tab3:
+                show_survey_responses(df, questions)
+            with tab4:
+                show_survey_data(df)
 
 
 # ============================================================
@@ -1553,15 +2406,19 @@ def run_survey_mode(personas, sample_size):
 # ============================================================
 
 def main():
-    personas = load_personas()
-    sample_size, mode = render_sidebar(personas)
+    consumer_personas = load_personas()
+    advisor_personas = load_advisor_personas()
+    sample_size, mode, panel, personas = render_sidebar(consumer_personas, advisor_personas)
+
+    is_advisor = (panel == "Financial Advisors")
+    panel_key = "advisor" if is_advisor else "consumer"
 
     if mode == "Idea Reactor":
-        run_reactor_mode(personas, sample_size)
+        run_reactor_mode(personas, sample_size, is_advisor, panel_key)
     elif mode == "A/B Test":
-        run_ab_test_mode(personas, sample_size)
+        run_ab_test_mode(personas, sample_size, is_advisor, panel_key)
     else:
-        run_survey_mode(personas, sample_size)
+        run_survey_mode(personas, sample_size, is_advisor, panel_key)
 
 
 if __name__ == "__main__":
