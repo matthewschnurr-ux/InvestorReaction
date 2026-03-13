@@ -1108,9 +1108,9 @@ def render_sidebar(personas):
 
         mode = st.radio(
             "Mode",
-            ["Idea Reactor", "Survey"],
+            ["Idea Reactor", "A/B Test", "Survey"],
             horizontal=True,
-            help="Idea Reactor tests investment ideas. Survey sends custom questions to the persona panel.",
+            help="Idea Reactor tests one idea. A/B Test compares two variants. Survey sends custom questions.",
         )
 
         st.divider()
@@ -1205,6 +1205,271 @@ def run_reactor_mode(personas, sample_size):
 
 
 # ============================================================
+# MODE: A/B TEST
+# ============================================================
+
+def show_ab_comparison(df_a, df_b, analysis_a, analysis_b, idea_a, idea_b):
+    st.subheader("Head-to-Head Comparison")
+
+    # Key metrics
+    avg_a = df_a["interest_score"].mean()
+    avg_b = df_b["interest_score"].mean()
+    invest_a = df_a["would_invest"].mean() * 100
+    invest_b = df_b["would_invest"].mean() * 100
+    median_a = df_a["interest_score"].median()
+    median_b = df_b["interest_score"].median()
+    sent_a = df_a["sentiment"].mode().iloc[0] if not df_a["sentiment"].mode().empty else "N/A"
+    sent_b = df_b["sentiment"].mode().iloc[0] if not df_b["sentiment"].mode().empty else "N/A"
+
+    col_a, col_vs, col_b = st.columns([5, 1, 5])
+    with col_a:
+        st.markdown("#### Variant A")
+        st.caption(f"*{idea_a[:120]}{'...' if len(idea_a) > 120 else ''}*")
+    with col_vs:
+        st.markdown("<div style='text-align:center; padding-top:20px; font-size:1.5em; font-weight:bold;'>vs</div>", unsafe_allow_html=True)
+    with col_b:
+        st.markdown("#### Variant B")
+        st.caption(f"*{idea_b[:120]}{'...' if len(idea_b) > 120 else ''}*")
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        winner = "A" if avg_a > avg_b else ("B" if avg_b > avg_a else "Tie")
+        st.metric("Avg Interest Score", f"{avg_a:.1f} vs {avg_b:.1f}", delta=f"{'A' if winner == 'A' else 'B'} wins by {abs(avg_a - avg_b):.1f}" if winner != "Tie" else "Tied")
+    with m2:
+        winner = "A" if invest_a > invest_b else ("B" if invest_b > invest_a else "Tie")
+        st.metric("Would Invest", f"{invest_a:.0f}% vs {invest_b:.0f}%", delta=f"{'A' if winner == 'A' else 'B'} +{abs(invest_a - invest_b):.0f}pp" if winner != "Tie" else "Tied")
+    with m3:
+        st.metric("Top Sentiment", f"{sent_a.title()} vs {sent_b.title()}")
+    with m4:
+        st.metric("Median Score", f"{median_a:.0f} vs {median_b:.0f}")
+
+    st.divider()
+
+    # Interest score distribution overlay
+    st.subheader("Interest Score Distribution")
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=df_a["interest_score"], name="Variant A", opacity=0.7, marker_color="#2d5a87", nbinsx=10))
+    fig.add_trace(go.Histogram(x=df_b["interest_score"], name="Variant B", opacity=0.7, marker_color="#e67e22", nbinsx=10))
+    fig.update_layout(barmode="overlay", xaxis_title="Interest Score", yaxis_title="Count", legend=dict(orientation="h", y=1.1))
+    st.plotly_chart(fig, use_container_width=True, key="ab_score_dist")
+
+    # Sentiment comparison
+    st.subheader("Sentiment Breakdown")
+    c1, c2 = st.columns(2)
+    with c1:
+        sent_a_counts = df_a["sentiment"].value_counts()
+        fig = px.pie(values=sent_a_counts.values, names=sent_a_counts.index, title="Variant A", color=sent_a_counts.index, color_discrete_map=SENTIMENT_COLORS)
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig, use_container_width=True, key="ab_sent_a")
+    with c2:
+        sent_b_counts = df_b["sentiment"].value_counts()
+        fig = px.pie(values=sent_b_counts.values, names=sent_b_counts.index, title="Variant B", color=sent_b_counts.index, color_discrete_map=SENTIMENT_COLORS)
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig, use_container_width=True, key="ab_sent_b")
+
+    # Investment amount comparison
+    if "investment_amount" in df_a.columns and "investment_amount" in df_b.columns:
+        st.subheader("Investment Amount Willingness")
+        amount_order = ["none", "small ($100-$1K)", "moderate ($1K-$10K)", "significant ($10K-$50K)", "major ($50K+)"]
+        amt_a = df_a["investment_amount"].value_counts().reindex(amount_order, fill_value=0)
+        amt_b = df_b["investment_amount"].value_counts().reindex(amount_order, fill_value=0)
+        amt_df = pd.DataFrame({"Amount": amount_order * 2, "Count": list(amt_a.values) + list(amt_b.values), "Variant": ["A"] * len(amount_order) + ["B"] * len(amount_order)})
+        fig = px.bar(amt_df, x="Amount", y="Count", color="Variant", barmode="group", color_discrete_map={"A": "#2d5a87", "B": "#e67e22"})
+        st.plotly_chart(fig, use_container_width=True, key="ab_amounts")
+
+    # Would invest by age group
+    st.subheader("% Would Invest by Demographics")
+    c1, c2 = st.columns(2)
+    with c1:
+        age_a = df_a.groupby("age_group", observed=True)["would_invest"].mean().mul(100).reset_index()
+        age_a.columns = ["Age Group", "% Would Invest"]
+        age_a["Variant"] = "A"
+        age_b = df_b.groupby("age_group", observed=True)["would_invest"].mean().mul(100).reset_index()
+        age_b.columns = ["Age Group", "% Would Invest"]
+        age_b["Variant"] = "B"
+        age_df = pd.concat([age_a, age_b])
+        fig = px.bar(age_df, x="Age Group", y="% Would Invest", color="Variant", barmode="group", title="By Age Group", color_discrete_map={"A": "#2d5a87", "B": "#e67e22"})
+        fig.update_layout(yaxis_range=[0, 100])
+        st.plotly_chart(fig, use_container_width=True, key="ab_age")
+
+    with c2:
+        inc_a = df_a.groupby("income_bracket", observed=True)["would_invest"].mean().mul(100).reset_index()
+        inc_a.columns = ["Income Bracket", "% Would Invest"]
+        inc_a["Variant"] = "A"
+        inc_b = df_b.groupby("income_bracket", observed=True)["would_invest"].mean().mul(100).reset_index()
+        inc_b.columns = ["Income Bracket", "% Would Invest"]
+        inc_b["Variant"] = "B"
+        inc_df = pd.concat([inc_a, inc_b])
+        fig = px.bar(inc_df, x="Income Bracket", y="% Would Invest", color="Variant", barmode="group", title="By Income Bracket", color_discrete_map={"A": "#2d5a87", "B": "#e67e22"})
+        fig.update_layout(yaxis_range=[0, 100])
+        st.plotly_chart(fig, use_container_width=True, key="ab_income")
+
+    # Risk tolerance comparison
+    risk_a = df_a.groupby("risk_tolerance_profile", observed=True)["would_invest"].mean().mul(100).reset_index()
+    risk_a.columns = ["Risk Tolerance", "% Would Invest"]
+    risk_a["Variant"] = "A"
+    risk_b = df_b.groupby("risk_tolerance_profile", observed=True)["would_invest"].mean().mul(100).reset_index()
+    risk_b.columns = ["Risk Tolerance", "% Would Invest"]
+    risk_b["Variant"] = "B"
+    risk_df = pd.concat([risk_a, risk_b])
+    risk_order = ["Very Conservative", "Conservative", "Moderate", "Growth", "Aggressive"]
+    risk_df["Risk Tolerance"] = pd.Categorical(risk_df["Risk Tolerance"], categories=risk_order, ordered=True)
+    risk_df = risk_df.sort_values("Risk Tolerance")
+    fig = px.bar(risk_df, x="Risk Tolerance", y="% Would Invest", color="Variant", barmode="group", title="By Risk Tolerance", color_discrete_map={"A": "#2d5a87", "B": "#e67e22"})
+    fig.update_layout(yaxis_range=[0, 100])
+    st.plotly_chart(fig, use_container_width=True, key="ab_risk")
+
+    # Top concerns and appeals side by side
+    st.subheader("Concerns & Appeals")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Top Concerns — Variant A**")
+        if analysis_a["top_concerns"]:
+            cdf = pd.DataFrame(analysis_a["top_concerns"][:8], columns=["Concern", "Count"])
+            fig = px.bar(cdf.iloc[::-1], x="Count", y="Concern", orientation="h", color_discrete_sequence=["#2d5a87"])
+            fig.update_layout(height=300)
+            st.plotly_chart(fig, use_container_width=True, key="ab_concerns_a")
+
+        st.markdown("**Top Appeals — Variant A**")
+        if analysis_a["top_appeals"]:
+            adf = pd.DataFrame(analysis_a["top_appeals"][:8], columns=["Appeal", "Count"])
+            fig = px.bar(adf.iloc[::-1], x="Count", y="Appeal", orientation="h", color_discrete_sequence=["#2d5a87"])
+            fig.update_layout(height=300)
+            st.plotly_chart(fig, use_container_width=True, key="ab_appeals_a")
+
+    with c2:
+        st.markdown("**Top Concerns — Variant B**")
+        if analysis_b["top_concerns"]:
+            cdf = pd.DataFrame(analysis_b["top_concerns"][:8], columns=["Concern", "Count"])
+            fig = px.bar(cdf.iloc[::-1], x="Count", y="Concern", orientation="h", color_discrete_sequence=["#e67e22"])
+            fig.update_layout(height=300)
+            st.plotly_chart(fig, use_container_width=True, key="ab_concerns_b")
+
+        st.markdown("**Top Appeals — Variant B**")
+        if analysis_b["top_appeals"]:
+            adf = pd.DataFrame(analysis_b["top_appeals"][:8], columns=["Appeal", "Count"])
+            fig = px.bar(adf.iloc[::-1], x="Count", y="Appeal", orientation="h", color_discrete_sequence=["#e67e22"])
+            fig.update_layout(height=300)
+            st.plotly_chart(fig, use_container_width=True, key="ab_appeals_b")
+
+    # Statistical summary
+    st.divider()
+    diff = avg_a - avg_b
+    pct_diff = abs(diff) / min(avg_a, avg_b) * 100 if min(avg_a, avg_b) > 0 else 0
+    winner_label = "Variant A" if diff > 0 else "Variant B" if diff < 0 else "Neither"
+    n = min(len(df_a), len(df_b))
+
+    try:
+        from scipy import stats
+        # Merge on persona_id for paired comparison
+        merged = df_a[["persona_id", "interest_score"]].merge(
+            df_b[["persona_id", "interest_score"]], on="persona_id", suffixes=("_a", "_b")
+        )
+        if len(merged) > 1:
+            t_stat, p_value = stats.ttest_rel(merged["interest_score_a"], merged["interest_score_b"])
+            sig = "statistically significant" if p_value < 0.05 else "not statistically significant"
+            st.info(f"**{winner_label}** scored higher by {abs(diff):.1f} points ({pct_diff:.0f}%). "
+                    f"Paired t-test: t={t_stat:.2f}, p={p_value:.3f} — {sig} at 95% confidence (n={len(merged)} paired responses).")
+        else:
+            st.info(f"**{winner_label}** scored higher by {abs(diff):.1f} points ({pct_diff:.0f}%) across {n} personas.")
+    except ImportError:
+        st.info(f"**{winner_label}** scored higher by {abs(diff):.1f} points ({pct_diff:.0f}%) across {n} personas.")
+
+
+def run_ab_test_mode(personas, sample_size):
+    st.title("A/B Test")
+    st.markdown("Compare two ideas or two ways of messaging the same idea. "
+                "Both variants are tested against the **same** persona sample for a fair comparison.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        idea_a = st.text_area(
+            "Variant A",
+            height=150,
+            placeholder="Example: A mobile app that rounds up purchases and invests the spare change into diversified ETF portfolios...",
+            key="ab_idea_a_input",
+        )
+    with c2:
+        idea_b = st.text_area(
+            "Variant B",
+            height=150,
+            placeholder="Example: An AI-powered investment advisor that creates personalized portfolios based on your spending habits...",
+            key="ab_idea_b_input",
+        )
+
+    both_filled = idea_a.strip() and idea_b.strip()
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        run_button = st.button("Run A/B Test", type="primary", use_container_width=True, disabled=not both_filled)
+    with col2:
+        if both_filled:
+            st.caption(f"Will test both variants against the same {sample_size} personas")
+
+    if run_button and both_filled:
+        sampled = stratified_sample(personas, sample_size)
+        st.info(f"Testing both variants against {len(sampled)} personas...")
+
+        st.markdown("**Testing Variant A...**")
+        reactions_a = collect_reactions(sampled, idea_a.strip())
+
+        st.markdown("**Testing Variant B...**")
+        reactions_b = collect_reactions(sampled, idea_b.strip())
+
+        st.session_state["ab_reactions_a"] = reactions_a
+        st.session_state["ab_reactions_b"] = reactions_b
+        st.session_state["ab_idea_a"] = idea_a.strip()
+        st.session_state["ab_idea_b"] = idea_b.strip()
+
+    if "ab_reactions_a" in st.session_state and "ab_reactions_b" in st.session_state:
+        reactions_a = st.session_state["ab_reactions_a"]
+        reactions_b = st.session_state["ab_reactions_b"]
+        idea_a_text = st.session_state.get("ab_idea_a", "Variant A")
+        idea_b_text = st.session_state.get("ab_idea_b", "Variant B")
+
+        df_a, analysis_a = build_analysis(reactions_a)
+        df_b, analysis_b = build_analysis(reactions_b)
+
+        if (df_a is None or df_a.empty) and (df_b is None or df_b.empty):
+            st.error("No valid reactions received for either variant. Check your API key and try again.")
+            return
+
+        st.divider()
+        st.header("A/B Test Results")
+
+        tab1, tab2, tab3 = st.tabs(["Comparison", "Variant A Detail", "Variant B Detail"])
+
+        with tab1:
+            if df_a is not None and df_b is not None and not df_a.empty and not df_b.empty:
+                show_ab_comparison(df_a, df_b, analysis_a, analysis_b, idea_a_text, idea_b_text)
+            else:
+                st.warning("One variant had no valid reactions. Cannot show comparison.")
+
+        with tab2:
+            if df_a is not None and not df_a.empty:
+                st.caption(f"Idea: *{idea_a_text[:150]}*")
+                show_overview(df_a)
+                show_demographics(df_a)
+                show_insights(df_a, analysis_a)
+                show_quotes(df_a)
+                show_data(df_a)
+            else:
+                st.warning("No valid reactions for Variant A.")
+
+        with tab3:
+            if df_b is not None and not df_b.empty:
+                st.caption(f"Idea: *{idea_b_text[:150]}*")
+                show_overview(df_b)
+                show_demographics(df_b)
+                show_insights(df_b, analysis_b)
+                show_quotes(df_b)
+                show_data(df_b)
+            else:
+                st.warning("No valid reactions for Variant B.")
+
+
+# ============================================================
 # MODE: SURVEY
 # ============================================================
 
@@ -1292,6 +1557,8 @@ def main():
 
     if mode == "Idea Reactor":
         run_reactor_mode(personas, sample_size)
+    elif mode == "A/B Test":
+        run_ab_test_mode(personas, sample_size)
     else:
         run_survey_mode(personas, sample_size)
 
