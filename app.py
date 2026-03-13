@@ -723,16 +723,16 @@ def show_insights(df, analysis):
             st.markdown(f"- {h} *({count})*")
 
 
-def show_quotes(df):
+def show_quotes(df, key_suffix=""):
     st.subheader("Verbatim Reactions")
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        filter_sentiment = st.selectbox("Filter by sentiment", ["All", "positive", "negative", "neutral", "mixed"])
+        filter_sentiment = st.selectbox("Filter by sentiment", ["All", "positive", "negative", "neutral", "mixed"], key=f"quote_sent{key_suffix}")
     with c2:
-        filter_invest = st.selectbox("Filter by would invest", ["All", "Yes", "No"])
+        filter_invest = st.selectbox("Filter by would invest", ["All", "Yes", "No"], key=f"quote_invest{key_suffix}")
     with c3:
-        sort_by = st.selectbox("Sort by", ["Interest Score (High to Low)", "Interest Score (Low to High)", "Random"])
+        sort_by = st.selectbox("Sort by", ["Interest Score (High to Low)", "Interest Score (Low to High)", "Random"], key=f"quote_sort{key_suffix}")
 
     filtered = df.copy()
     if filter_sentiment != "All":
@@ -775,7 +775,7 @@ def show_quotes(df):
             st.caption(f"{row.get('life_stage', '')} | {row.get('education', '')} | Income: ${row.get('income', 0):,} | {row.get('risk_tolerance_profile', '')} risk | {row.get('investment_knowledge', '')} investor")
 
 
-def show_data(df):
+def show_data(df, key_suffix=""):
     st.subheader("Raw Data")
 
     display_cols = [
@@ -784,7 +784,7 @@ def show_data(df):
         "investment_amount", "gut_reaction",
     ]
     available = [c for c in display_cols if c in df.columns]
-    st.dataframe(df[available].sort_values("interest_score", ascending=False), use_container_width=True, height=500)
+    st.dataframe(df[available].sort_values("interest_score", ascending=False), use_container_width=True, height=500, key=f"data_table{key_suffix}")
 
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -792,6 +792,7 @@ def show_data(df):
         data=csv,
         file_name=f"reactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
+        key=f"download_csv{key_suffix}",
     )
 
 
@@ -1452,8 +1453,8 @@ def run_ab_test_mode(personas, sample_size):
                 show_overview(df_a)
                 show_demographics(df_a)
                 show_insights(df_a, analysis_a)
-                show_quotes(df_a)
-                show_data(df_a)
+                show_quotes(df_a, key_suffix="_ab_a")
+                show_data(df_a, key_suffix="_ab_a")
             else:
                 st.warning("No valid reactions for Variant A.")
 
@@ -1463,8 +1464,8 @@ def run_ab_test_mode(personas, sample_size):
                 show_overview(df_b)
                 show_demographics(df_b)
                 show_insights(df_b, analysis_b)
-                show_quotes(df_b)
-                show_data(df_b)
+                show_quotes(df_b, key_suffix="_ab_b")
+                show_data(df_b, key_suffix="_ab_b")
             else:
                 st.warning("No valid reactions for Variant B.")
 
