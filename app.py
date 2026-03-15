@@ -31,6 +31,9 @@ MODEL_NAME = "gemini-3.1-flash-lite-preview"
 MAX_WORKERS = 10
 PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "personas.json")
 ADVISOR_PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "advisor_personas.json")
+USAGE_LOG_FILE = os.path.join(os.path.dirname(__file__), "usage_log.json")
+ADMIN_SECRET = st.secrets.get("ADMIN_KEY", "persona-reactor-admin-2024")
+COST_PER_API_CALL = 0.0001  # Estimated cost per Gemini Flash-Lite call (USD)
 
 REACTION_PROMPT = """You are roleplaying as this Canadian investor persona. Stay fully in character. Think and respond as this specific person would, given their background, financial situation, knowledge level, and life circumstances.
 
@@ -224,6 +227,27 @@ def load_personas():
 def load_advisor_personas():
     with open(ADVISOR_PERSONAS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+# ============================================================
+# USAGE LOGGING
+# ============================================================
+
+def log_usage(entry):
+    """Append a usage entry to the persistent log file."""
+    entry["timestamp"] = datetime.now().isoformat()
+    entry["estimated_cost_usd"] = round(entry.get("api_calls", 0) * COST_PER_API_CALL, 4)
+    try:
+        if os.path.exists(USAGE_LOG_FILE):
+            with open(USAGE_LOG_FILE, "r", encoding="utf-8") as f:
+                log = json.load(f)
+        else:
+            log = []
+        log.append(entry)
+        with open(USAGE_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass  # Don't break the app if logging fails
 
 
 def stratified_sample(personas, n):
@@ -1964,6 +1988,19 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
         st.session_state[reactions_key] = reactions
         st.session_state[idea_key] = idea.strip()
 
+        errors = sum(1 for r in reactions if "error" in r)
+        valid = [r for r in reactions if "error" not in r]
+        avg_score = sum(r.get("interest_score", 0) for r in valid) / len(valid) if valid else 0
+        log_usage({
+            "mode": "Idea Reactor",
+            "panel": panel_key,
+            "sample_size": len(sampled),
+            "api_calls": len(sampled),
+            "errors": errors,
+            "idea_preview": idea.strip()[:100],
+            "key_results": {"avg_interest_score": round(avg_score, 1), "valid_responses": len(valid)},
+        })
+
     if reactions_key in st.session_state:
         reactions = st.session_state[reactions_key]
         build_fn = build_advisor_analysis if is_advisor else build_analysis
@@ -2229,6 +2266,18 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
         st.session_state[ida_key] = idea_a.strip()
         st.session_state[idb_key] = idea_b.strip()
 
+        errors_a = sum(1 for r in reactions_a if "error" in r)
+        errors_b = sum(1 for r in reactions_b if "error" in r)
+        log_usage({
+            "mode": "A/B Test",
+            "panel": panel_key,
+            "sample_size": len(sampled),
+            "api_calls": len(sampled) * 2,
+            "errors": errors_a + errors_b,
+            "idea_preview": f"A: {idea_a.strip()[:50]} | B: {idea_b.strip()[:50]}",
+            "key_results": {"valid_a": len(sampled) - errors_a, "valid_b": len(sampled) - errors_b},
+        })
+
     if rxa_key in st.session_state and rxb_key in st.session_state:
         reactions_a = st.session_state[rxa_key]
         reactions_b = st.session_state[rxb_key]
@@ -2359,6 +2408,17 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
         st.session_state[resp_key] = responses
         st.session_state[q_key] = questions
 
+        errors = sum(1 for r in responses if "error" in r)
+        log_usage({
+            "mode": "Survey",
+            "panel": panel_key,
+            "sample_size": len(sampled),
+            "api_calls": len(sampled),
+            "errors": errors,
+            "idea_preview": f"Survey: {len(questions)} questions",
+            "key_results": {"questions": len(questions), "valid_responses": len(sampled) - errors},
+        })
+
     if resp_key in st.session_state and q_key in st.session_state:
         responses = st.session_state[resp_key]
         questions = st.session_state[q_key]
@@ -2401,11 +2461,141 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
                 show_survey_data(df)
 
 
+
+# ============================================================
+# ADMIN DASHBOARD
+# ============================================================
+
+def run_admin_dashboard():
+    st.title("📊 Usage Report")
+    st.caption("Admin dashboard — persistent usage tracking across sessions")
+
+    if not os.path.exists(USAGE_LOG_FILE):
+        st.info("No usage data yet. Run some tests first.")
+        return
+
+    with open(USAGE_LOG_FILE, "r", encoding="utf-8") as f:
+        log = json.load(f)
+
+    if not log:
+        st.info("No usage data yet. Run some tests first.")
+        return
+
+    df = pd.DataFrame(log)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["date"] = df["timestamp"].dt.date
+
+    # --- Summary Metrics ---
+    st.header("Summary")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Total Tests Run", len(df))
+    with m2:
+        st.metric("Total API Calls", f"{df['api_calls'].sum():,}")
+    with m3:
+        st.metric("Estimated Total Cost", f"${df['estimated_cost_usd'].sum():.2f}")
+    with m4:
+        error_rate = df["errors"].sum() / df["api_calls"].sum() * 100 if df["api_calls"].sum() > 0 else 0
+        st.metric("Error Rate", f"{error_rate:.1f}%")
+
+    st.divider()
+
+    # --- Charts ---
+    st.header("Usage Trends")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # Tests per day
+        daily = df.groupby("date").size().reset_index(name="tests")
+        daily["date"] = pd.to_datetime(daily["date"])
+        fig = px.bar(daily, x="date", y="tests", title="Tests Per Day",
+                     labels={"date": "Date", "tests": "Tests Run"},
+                     color_discrete_sequence=["#2d5a87"])
+        fig.update_layout(xaxis_title="", yaxis_title="Tests")
+        st.plotly_chart(fig, use_container_width=True, key="admin_daily")
+
+    with col2:
+        # API calls per day
+        daily_calls = df.groupby("date")["api_calls"].sum().reset_index()
+        daily_calls["date"] = pd.to_datetime(daily_calls["date"])
+        fig = px.bar(daily_calls, x="date", y="api_calls", title="API Calls Per Day",
+                     labels={"date": "Date", "api_calls": "API Calls"},
+                     color_discrete_sequence=["#e67e22"])
+        fig.update_layout(xaxis_title="", yaxis_title="API Calls")
+        st.plotly_chart(fig, use_container_width=True, key="admin_api_daily")
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        # By mode
+        mode_counts = df["mode"].value_counts()
+        fig = px.pie(values=mode_counts.values, names=mode_counts.index,
+                     title="Usage by Mode",
+                     color_discrete_sequence=["#2d5a87", "#e67e22", "#27ae60"])
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig, use_container_width=True, key="admin_mode_pie")
+
+    with col4:
+        # By panel
+        panel_counts = df["panel"].value_counts()
+        panel_labels = panel_counts.index.map(lambda x: "Financial Advisors" if x == "advisor" else "Canadians as a Whole")
+        fig = px.pie(values=panel_counts.values, names=panel_labels,
+                     title="Usage by Panel",
+                     color_discrete_sequence=["#3498db", "#9b59b6"])
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig, use_container_width=True, key="admin_panel_pie")
+
+    st.divider()
+
+    # --- Cost breakdown ---
+    st.header("Cost Breakdown")
+    cost_by_mode = df.groupby("mode")["estimated_cost_usd"].sum().reset_index()
+    cost_by_mode.columns = ["Mode", "Cost (USD)"]
+    cost_by_panel = df.groupby("panel")["estimated_cost_usd"].sum().reset_index()
+    cost_by_panel.columns = ["Panel", "Cost (USD)"]
+    cost_by_panel["Panel"] = cost_by_panel["Panel"].map(lambda x: "Financial Advisors" if x == "advisor" else "Canadians as a Whole")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("By Mode")
+        st.dataframe(cost_by_mode, use_container_width=True, hide_index=True)
+    with c2:
+        st.subheader("By Panel")
+        st.dataframe(cost_by_panel, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # --- Activity Log ---
+    st.header("Activity Log")
+    display_df = df[["timestamp", "mode", "panel", "sample_size", "api_calls", "errors", "estimated_cost_usd", "idea_preview"]].copy()
+    display_df.columns = ["Timestamp", "Mode", "Panel", "Sample Size", "API Calls", "Errors", "Cost (USD)", "Idea Preview"]
+    display_df["Panel"] = display_df["Panel"].map(lambda x: "Advisors" if x == "advisor" else "Consumers")
+    display_df = display_df.sort_values("Timestamp", ascending=False)
+    st.dataframe(display_df, use_container_width=True, hide_index=True, height=400)
+
+    # --- Download ---
+    csv = display_df.to_csv(index=False)
+    st.download_button(
+        "Download Usage Log (CSV)",
+        csv,
+        f"usage_log_{datetime.now().strftime('%Y%m%d')}.csv",
+        "text/csv",
+        key="admin_download",
+    )
+
+
 # ============================================================
 # MAIN APP
 # ============================================================
 
 def main():
+    # Admin dashboard - accessible via ?admin=<secret>
+    params = st.query_params
+    if params.get("admin") == ADMIN_SECRET:
+        run_admin_dashboard()
+        return
+
     consumer_personas = load_personas()
     advisor_personas = load_advisor_personas()
     sample_size, mode, panel, personas = render_sidebar(consumer_personas, advisor_personas)
