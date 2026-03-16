@@ -294,6 +294,25 @@ def render_question_builder(panel_key="consumer"):
         questions.pop(to_remove)
         st.rerun()
 
+    # --- Bottom Add Buttons (visible after scrolling through questions) ---
+    if questions:
+        st.divider()
+        bcol1, bcol2 = st.columns(2)
+        with bcol1:
+            if st.button("➕ Open-Ended Question", key=f"{panel_key}_add_open_btm",
+                          use_container_width=True):
+                st.session_state[counter_key] += 1
+                questions.append({"id": st.session_state[counter_key],
+                                  "type": "open", "text": ""})
+                st.rerun()
+        with bcol2:
+            if st.button("➕ Multiple-Choice Question", key=f"{panel_key}_add_mc_btm",
+                          use_container_width=True):
+                st.session_state[counter_key] += 1
+                questions.append({"id": st.session_state[counter_key],
+                                  "type": "mc", "text": "", "options": ["", ""]})
+                st.rerun()
+
     # --- Build Validated Output ---
     valid_questions = []
     for q in questions:
