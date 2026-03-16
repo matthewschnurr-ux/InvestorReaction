@@ -13,6 +13,9 @@ import time
 import re
 import random
 import os
+import xml.etree.ElementTree as ET
+from urllib.request import urlopen, Request
+from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from datetime import datetime
@@ -39,7 +42,7 @@ REACTION_PROMPT = """You are roleplaying as this Canadian investor persona. Stay
 
 PERSONA:
 {persona}
-
+{context}
 React to the following investment idea, product, or concept. Consider your financial situation, investment goals, risk tolerance, knowledge level, and life stage.
 
 IDEA:
@@ -62,7 +65,7 @@ SURVEY_PROMPT = """You are roleplaying as this Canadian persona. Stay fully in c
 
 PERSONA:
 {persona}
-
+{context}
 You are being surveyed. Answer each question honestly and naturally from this persona's perspective. Consider your age, income, education, family situation, values, location, and life experiences.
 
 For multiple-choice questions:
@@ -101,7 +104,7 @@ ADVISOR_REACTION_PROMPT = """You are roleplaying as this Canadian financial advi
 
 PERSONA:
 {persona}
-
+{context}
 React to the following investment idea, product, or concept FROM A PROFESSIONAL PERSPECTIVE. Consider whether you would recommend this to your clients, how it fits various client profiles, regulatory considerations, and practical implementation in your practice.
 
 IDEA:
@@ -124,7 +127,7 @@ ADVISOR_SURVEY_PROMPT = """You are roleplaying as this Canadian financial adviso
 
 PERSONA:
 {persona}
-
+{context}
 You are being surveyed about your professional opinions and practices. Answer each question honestly and naturally from this advisor's professional perspective. Consider your experience, client base, firm type, designations, and practice focus.
 
 For multiple-choice questions:
@@ -339,6 +342,96 @@ def render_question_builder(panel_key="consumer"):
     return valid_questions
 
 
+
+def fetch_news_context(topic):
+    """Fetch recent headlines from Google News RSS and summarize with one Gemini call."""
+    try:
+        url = f"https://news.google.com/rss/search?q={quote_plus(topic)}&hl=en-CA&gl=CA&ceid=CA:en"
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            xml_data = resp.read()
+        root = ET.fromstring(xml_data)
+        items = root.findall(".//item")[:10]
+        headlines = []
+        for item in items:
+            title = item.findtext("title", "")
+            if title:
+                headlines.append(title)
+        if not headlines:
+            return f"No recent news found for: {topic}"
+        headline_text = "\n".join(f"- {h}" for h in headlines)
+        client = genai.Client(api_key=API_KEY)
+        summary_prompt = (
+            f"Below are recent news headlines about \"{topic}\". "
+            f"Summarize the key themes and current situation in 2-3 concise sentences. "
+            f"Focus on facts and developments that would shape how a Canadian would think "
+            f"about this topic today. Be neutral and factual.\n\n"
+            f"HEADLINES:\n{headline_text}\n\n"
+            f"SUMMARY:"
+        )
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=summary_prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=300,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        return response.text.strip()
+    except Exception as e:
+        return f"Could not fetch news: {str(e)[:200]}"
+
+
+def render_context_panel(panel_key="consumer"):
+    """Render an optional current events context panel. Returns context string."""
+    area_key = f"{panel_key}_context_area"
+    topic_key = f"{panel_key}_news_topic"
+
+    if area_key not in st.session_state:
+        st.session_state[area_key] = ""
+    if topic_key not in st.session_state:
+        st.session_state[topic_key] = ""
+
+    with st.expander("\U0001f4f0 Current Events Context (Optional)", expanded=bool(st.session_state[area_key])):
+        st.caption(
+            "Ground personas in recent events so their responses reflect current reality. "
+            "Enter a topic to auto-fetch headlines, or type your own context below."
+        )
+        tcol1, tcol2 = st.columns([3, 1])
+        with tcol1:
+            topic = st.text_input(
+                "News Topic",
+                value=st.session_state[topic_key],
+                key=f"{panel_key}_topic_input",
+                placeholder="e.g. Canada US trade relations, Canadian housing market...",
+                label_visibility="collapsed",
+            )
+        with tcol2:
+            fetch_btn = st.button(
+                "\U0001f50d Fetch Headlines",
+                key=f"{panel_key}_fetch_news",
+                use_container_width=True,
+                disabled=not topic.strip(),
+            )
+
+        if fetch_btn and topic.strip():
+            st.session_state[topic_key] = topic.strip()
+            with st.spinner("Fetching and summarizing recent headlines..."):
+                summary = fetch_news_context(topic.strip())
+            st.session_state[area_key] = summary
+            st.rerun()
+
+        context = st.text_area(
+            "Context (edit or type your own)",
+            key=area_key,
+            height=100,
+            placeholder="Recent events, market conditions, or other context that personas should consider when responding...",
+        )
+
+    return context.strip()
+
+
 # ============================================================
 # PAGE CONFIG
 # ============================================================
@@ -511,10 +604,11 @@ def make_error_result(persona, error_msg):
 # API CALLS - REACTOR
 # ============================================================
 
-def get_reaction(client, persona, idea, is_advisor=False):
+def get_reaction(client, persona, idea, is_advisor=False, context=""):
     prompt_template = ADVISOR_REACTION_PROMPT if is_advisor else REACTION_PROMPT
     attach_fn = attach_advisor_metadata if is_advisor else attach_persona_metadata
-    prompt = prompt_template.format(persona=persona["persona_summary"], idea=idea)
+    ctx_block = f"\nCURRENT EVENTS CONTEXT (recent developments this persona would be aware of):\n{context}\n" if context else "\n"
+    prompt = prompt_template.format(persona=persona["persona_summary"], idea=idea, context=ctx_block)
     for attempt in range(3):
         try:
             response = client.models.generate_content(
@@ -548,7 +642,7 @@ def get_reaction(client, persona, idea, is_advisor=False):
             return make_error_result(persona, str(e)[:100])
 
 
-def collect_reactions(personas, idea, is_advisor=False):
+def collect_reactions(personas, idea, is_advisor=False, context=""):
     client = genai.Client(api_key=API_KEY)
     total = len(personas)
     reactions = []
@@ -561,7 +655,7 @@ def collect_reactions(personas, idea, is_advisor=False):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_persona = {}
         for persona in personas:
-            future = executor.submit(get_reaction, client, persona, idea, is_advisor)
+            future = executor.submit(get_reaction, client, persona, idea, is_advisor, context)
             future_to_persona[future] = persona
             time.sleep(delay)
 
@@ -584,14 +678,16 @@ def collect_reactions(personas, idea, is_advisor=False):
 # API CALLS - SURVEY
 # ============================================================
 
-def get_survey_response(client, persona, questions, is_advisor=False):
+def get_survey_response(client, persona, questions, is_advisor=False, context=""):
     seed = hash(persona.get("id", persona.get("persona_summary", "")))
     questions_formatted = format_questions_for_prompt(questions, seed=seed)
     prompt_template = ADVISOR_SURVEY_PROMPT if is_advisor else SURVEY_PROMPT
     attach_fn = attach_advisor_metadata if is_advisor else attach_persona_metadata
+    ctx_block = f"\nCURRENT EVENTS CONTEXT (recent developments this persona would be aware of):\n{context}\n" if context else "\n"
     prompt = prompt_template.format(
         persona=persona["persona_summary"],
         questions_formatted=questions_formatted,
+        context=ctx_block,
     )
     for attempt in range(3):
         try:
@@ -626,7 +722,7 @@ def get_survey_response(client, persona, questions, is_advisor=False):
             return make_error_result(persona, str(e)[:100])
 
 
-def collect_survey_responses(personas, questions, is_advisor=False):
+def collect_survey_responses(personas, questions, is_advisor=False, context=""):
     client = genai.Client(api_key=API_KEY)
     total = len(personas)
     responses = []
@@ -639,7 +735,7 @@ def collect_survey_responses(personas, questions, is_advisor=False):
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_persona = {}
         for persona in personas:
-            future = executor.submit(get_survey_response, client, persona, questions, is_advisor)
+            future = executor.submit(get_survey_response, client, persona, questions, is_advisor, context)
             future_to_persona[future] = persona
             time.sleep(delay)
 
@@ -2121,6 +2217,8 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
         idea_label = "Investment Idea"
         placeholder = "Example: A mobile app that lets Canadians invest spare change from everyday purchases into diversified ETF portfolios, with automatic TFSA contribution tracking and a built-in financial literacy program..."
 
+    context = render_context_panel(panel_key)
+
     idea = st.text_area(idea_label, height=150, placeholder=placeholder)
 
     col1, col2 = st.columns([1, 4])
@@ -2141,7 +2239,7 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
         st.info(f"Testing against {len(sampled)} {panel_label} (stratified sample from {len(personas)})")
 
         with st.spinner("Collecting reactions..."):
-            reactions = collect_reactions(sampled, idea.strip(), is_advisor=is_advisor)
+            reactions = collect_reactions(sampled, idea.strip(), is_advisor=is_advisor, context=context)
 
         st.session_state[reactions_key] = reactions
         st.session_state[idea_key] = idea.strip()
@@ -2380,6 +2478,8 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
     st.markdown(f"Compare two ideas or two ways of messaging the same idea. "
                 f"Both variants are tested against the **same** {panel_label} sample for a fair comparison.")
 
+    context = render_context_panel(panel_key)
+
     c1, c2 = st.columns(2)
     with c1:
         idea_a = st.text_area(
@@ -2414,10 +2514,10 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
         st.info(f"Testing both variants against {len(sampled)} {panel_label}...")
 
         st.markdown("**Testing Variant A...**")
-        reactions_a = collect_reactions(sampled, idea_a.strip(), is_advisor=is_advisor)
+        reactions_a = collect_reactions(sampled, idea_a.strip(), is_advisor=is_advisor, context=context)
 
         st.markdown("**Testing Variant B...**")
-        reactions_b = collect_reactions(sampled, idea_b.strip(), is_advisor=is_advisor)
+        reactions_b = collect_reactions(sampled, idea_b.strip(), is_advisor=is_advisor, context=context)
 
         st.session_state[rxa_key] = reactions_a
         st.session_state[rxb_key] = reactions_b
@@ -2513,6 +2613,8 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
         st.title("Survey Your Persona Panel")
         st.markdown("Build your survey below. Add open-ended or multiple-choice questions using the buttons.")
 
+    context = render_context_panel(panel_key)
+
     questions = render_question_builder(panel_key)
 
     panel_label = "advisors" if is_advisor else "personas"
@@ -2532,7 +2634,7 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
         st.info(f"Surveying {len(sampled)} {panel_label} with {len(questions)} questions...")
 
         with st.spinner("Collecting survey responses..."):
-            responses = collect_survey_responses(sampled, questions, is_advisor=is_advisor)
+            responses = collect_survey_responses(sampled, questions, is_advisor=is_advisor, context=context)
 
         st.session_state[resp_key] = responses
         st.session_state[q_key] = questions
