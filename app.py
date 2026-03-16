@@ -65,7 +65,14 @@ PERSONA:
 
 You are being surveyed. Answer each question honestly and naturally from this persona's perspective. Consider your age, income, education, family situation, values, location, and life experiences.
 
-For multiple-choice questions, you MUST select exactly ONE of the provided options as your answer in the "selected_option" field. Also provide a brief explanation in the "answer" field.
+For multiple-choice questions:
+- Read ALL options carefully before deciding.
+- Consider how each option relates to your specific background, values, and circumstances.
+- Different people with different backgrounds would genuinely choose different options.
+- Select the ONE option that BEST fits YOUR specific persona.
+- Set "selected_option" to the exact text of your chosen option.
+- In your "answer" field, briefly explain why this option fits you and why another option did not.
+
 For open-ended questions, set "selected_option" to null and provide your full answer in the "answer" field.
 
 QUESTIONS:
@@ -120,7 +127,14 @@ PERSONA:
 
 You are being surveyed about your professional opinions and practices. Answer each question honestly and naturally from this advisor's professional perspective. Consider your experience, client base, firm type, designations, and practice focus.
 
-For multiple-choice questions, you MUST select exactly ONE of the provided options as your answer in the "selected_option" field. Also provide a brief explanation in the "answer" field.
+For multiple-choice questions:
+- Read ALL options carefully before deciding.
+- Consider how each option relates to your specific background, values, and circumstances.
+- Different people with different backgrounds would genuinely choose different options.
+- Select the ONE option that BEST fits YOUR specific persona.
+- Set "selected_option" to the exact text of your chosen option.
+- In your "answer" field, briefly explain why this option fits you and why another option did not.
+
 For open-ended questions, set "selected_option" to null and provide your full answer in the "answer" field.
 
 QUESTIONS:
@@ -168,18 +182,142 @@ def parse_questions(raw_text):
     return questions
 
 
-def format_questions_for_prompt(questions):
-    """Format structured questions for the LLM prompt."""
+def format_questions_for_prompt(questions, seed=None):
+    """Format structured questions for the LLM prompt.
+
+    If seed is provided, MC option order is shuffled per-persona to reduce
+    position bias in responses.
+    """
+    rng = random.Random(seed) if seed is not None else None
     lines = []
     for i, q in enumerate(questions, 1):
         if q["type"] == "mc":
+            options = list(q["options"])
+            if rng:
+                rng.shuffle(options)
             option_lines = "\n".join(
-                f"  {chr(97+j)}) {opt}" for j, opt in enumerate(q["options"])
+                f"  {chr(97+j)}) {opt}" for j, opt in enumerate(options)
             )
-            lines.append(f"Q{i}. (Choose ONE) {q['text']}\n{option_lines}")
+            lines.append(
+                f"Q{i}. [MULTIPLE CHOICE - select exactly one]\n"
+                f"  {q['text']}\n"
+                f"  Options:\n{option_lines}"
+            )
         else:
-            lines.append(f"Q{i}. (Open-ended) {q['text']}")
+            lines.append(f"Q{i}. [OPEN-ENDED]\n  {q['text']}")
     return "\n\n".join(lines)
+
+
+
+def render_question_builder(panel_key="consumer"):
+    """Render a structured question builder UI. Returns list of question dicts."""
+    builder_key = f"{panel_key}_question_builder"
+    counter_key = f"{panel_key}_q_counter"
+
+    if builder_key not in st.session_state:
+        st.session_state[builder_key] = []
+    if counter_key not in st.session_state:
+        st.session_state[counter_key] = 0
+
+    questions = st.session_state[builder_key]
+
+    # --- Add Question Buttons ---
+    col_add1, col_add2 = st.columns(2)
+    with col_add1:
+        if st.button("\u2795 Open-Ended Question", key=f"{panel_key}_add_open",
+                      use_container_width=True):
+            st.session_state[counter_key] += 1
+            questions.append({"id": st.session_state[counter_key],
+                              "type": "open", "text": ""})
+            st.rerun()
+    with col_add2:
+        if st.button("\u2795 Multiple-Choice Question", key=f"{panel_key}_add_mc",
+                      use_container_width=True):
+            st.session_state[counter_key] += 1
+            questions.append({"id": st.session_state[counter_key],
+                              "type": "mc", "text": "", "options": ["", ""]})
+            st.rerun()
+
+    if not questions:
+        st.info("Add questions using the buttons above.")
+
+    # --- Render Each Question ---
+    to_remove = None
+    for idx, q in enumerate(questions):
+        qid = q["id"]
+        with st.container(border=True):
+            header_col, remove_col = st.columns([6, 1])
+            with header_col:
+                q_type_label = "Multiple Choice" if q["type"] == "mc" else "Open-Ended"
+                st.markdown(f"**Q{idx + 1}** \u2014 {q_type_label}")
+            with remove_col:
+                if st.button("\u2716", key=f"{panel_key}_rm_{qid}",
+                             help="Remove this question"):
+                    to_remove = idx
+
+            q["text"] = st.text_input(
+                "Question",
+                value=q.get("text", ""),
+                key=f"{panel_key}_qt_{qid}",
+                label_visibility="collapsed",
+                placeholder="Enter your question here...",
+            )
+
+            if q["type"] == "mc":
+                opt_to_remove = None
+                for opt_idx, opt in enumerate(q["options"]):
+                    opt_col, rm_col = st.columns([8, 1])
+                    with opt_col:
+                        q["options"][opt_idx] = st.text_input(
+                            f"Option {chr(65 + opt_idx)}",
+                            value=opt,
+                            key=f"{panel_key}_qo_{qid}_{opt_idx}",
+                            placeholder=f"Option {chr(65 + opt_idx)}",
+                        )
+                    with rm_col:
+                        if len(q["options"]) > 2:
+                            if st.button("\u2716", key=f"{panel_key}_ro_{qid}_{opt_idx}",
+                                         help="Remove option"):
+                                opt_to_remove = opt_idx
+
+                if opt_to_remove is not None:
+                    q["options"].pop(opt_to_remove)
+                    st.rerun()
+
+                if len(q["options"]) < 8:
+                    if st.button("+ Add Option", key=f"{panel_key}_ao_{qid}",
+                                 type="secondary"):
+                        q["options"].append("")
+                        st.rerun()
+
+    if to_remove is not None:
+        questions.pop(to_remove)
+        st.rerun()
+
+    # --- Build Validated Output ---
+    valid_questions = []
+    for q in questions:
+        if not q.get("text", "").strip():
+            continue
+        if q["type"] == "mc":
+            valid_opts = [o.strip() for o in q.get("options", []) if o.strip()]
+            if len(valid_opts) >= 2:
+                valid_questions.append({
+                    "type": "mc",
+                    "text": q["text"].strip(),
+                    "options": valid_opts,
+                })
+        else:
+            valid_questions.append({"type": "open", "text": q["text"].strip()})
+
+    if valid_questions:
+        n_open = sum(1 for q in valid_questions if q["type"] == "open")
+        n_mc = sum(1 for q in valid_questions if q["type"] == "mc")
+        st.caption(f"\u2705 {len(valid_questions)} valid question(s) ready ({n_open} open-ended, {n_mc} multiple-choice)")
+    elif questions:
+        st.warning("Fill in question text and at least 2 options for MC questions.")
+
+    return valid_questions
 
 
 # ============================================================
@@ -428,7 +566,8 @@ def collect_reactions(personas, idea, is_advisor=False):
 # ============================================================
 
 def get_survey_response(client, persona, questions, is_advisor=False):
-    questions_formatted = format_questions_for_prompt(questions)
+    seed = hash(persona.get("id", persona.get("persona_summary", "")))
+    questions_formatted = format_questions_for_prompt(questions, seed=seed)
     prompt_template = ADVISOR_SURVEY_PROMPT if is_advisor else SURVEY_PROMPT
     attach_fn = attach_advisor_metadata if is_advisor else attach_persona_metadata
     prompt = prompt_template.format(
@@ -2350,41 +2489,12 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
 def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer"):
     if is_advisor:
         st.title("Survey Your Advisor Panel")
-        st.markdown("Enter custom questions to ask the financial advisor panel. One question per line. "
-                    "For multiple-choice, add options in brackets: `Which do you prefer? [A, B, C]`")
-        placeholder_text = ("Example:\nWhat is the biggest challenge in your practice right now?\n"
-                            "Which asset class do you expect to grow most in the next 5 years? [Equities, Fixed Income, Alternatives, Real Estate, Crypto]\n"
-                            "How do you communicate with clients during market downturns?\n"
-                            "What is your preferred fee model? [Fee-only, Fee-based hybrid, Commission-based]")
+        st.markdown("Build your survey below. Add open-ended or multiple-choice questions using the buttons.")
     else:
         st.title("Survey Your Persona Panel")
-        st.markdown("Enter custom questions to ask the persona panel. One question per line. "
-                    "For multiple-choice, add options in brackets: `Which do you prefer? [A, B, C]`")
-        placeholder_text = ("Example:\nWould you consider switching banks for better digital features?\n"
-                            "Which investment type do you prefer? [Stocks, Bonds, Real Estate, Crypto]\n"
-                            "How important is ESG / responsible investing to you?\n"
-                            "How often do you check your portfolio? [Daily, Weekly, Monthly, Rarely]")
+        st.markdown("Build your survey below. Add open-ended or multiple-choice questions using the buttons.")
 
-    questions_text = st.text_area(
-        "Survey Questions (one per line)", height=200,
-        placeholder=placeholder_text,
-        key=f"{panel_key}_survey_questions_input",
-    )
-
-    questions = parse_questions(questions_text) if questions_text.strip() else []
-
-    if questions:
-        n_open = sum(1 for q in questions if q["type"] == "open")
-        n_mc = sum(1 for q in questions if q["type"] == "mc")
-        st.caption(f"{len(questions)} question(s) detected ({n_open} open-ended, {n_mc} multiple-choice):")
-        for i, q in enumerate(questions, 1):
-            if q["type"] == "mc":
-                options_str = " | ".join(q["options"])
-                st.markdown(f"**Q{i}.** *(MC)* {q['text']}  \n&nbsp;&nbsp;&nbsp;&nbsp;Options: {options_str}")
-            else:
-                st.markdown(f"**Q{i}.** *(Open)* {q['text']}")
-        if len(questions) > 10:
-            st.warning("More than 10 questions may produce longer response times and occasional truncation.")
+    questions = render_question_builder(panel_key)
 
     panel_label = "advisors" if is_advisor else "personas"
     col1, col2 = st.columns([1, 4])
