@@ -18,6 +18,7 @@ from urllib.request import urlopen, Request
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
+from difflib import SequenceMatcher
 from datetime import datetime
 
 from google import genai
@@ -72,8 +73,9 @@ For multiple-choice questions:
 - Read ALL options carefully before deciding.
 - Consider how each option relates to your specific background, values, and circumstances.
 - Different people with different backgrounds would genuinely choose different options.
-- Select the ONE option that BEST fits YOUR specific persona.
-- Set "selected_option" to the exact text of your chosen option.
+- You MUST select exactly ONE of the provided options. Do NOT create your own answer, say "other", "none of the above", or refuse to choose.
+- Even if no option is a perfect fit, pick the CLOSEST one to your perspective.
+- Set "selected_option" to the EXACT text of your chosen option, copied verbatim from the list.
 - In your "answer" field, briefly explain why this option fits you and why another option did not.
 
 For open-ended questions, set "selected_option" to null and provide your full answer in the "answer" field.
@@ -134,8 +136,9 @@ For multiple-choice questions:
 - Read ALL options carefully before deciding.
 - Consider how each option relates to your specific background, values, and circumstances.
 - Different people with different backgrounds would genuinely choose different options.
-- Select the ONE option that BEST fits YOUR specific persona.
-- Set "selected_option" to the exact text of your chosen option.
+- You MUST select exactly ONE of the provided options. Do NOT create your own answer, say "other", "none of the above", or refuse to choose.
+- Even if no option is a perfect fit, pick the CLOSEST one to your perspective.
+- Set "selected_option" to the EXACT text of your chosen option, copied verbatim from the list.
 - In your "answer" field, briefly explain why this option fits you and why another option did not.
 
 For open-ended questions, set "selected_option" to null and provide your full answer in the "answer" field.
@@ -183,6 +186,31 @@ def parse_questions(raw_text):
         else:
             questions.append({"type": "open", "text": line})
     return questions
+
+
+def _fuzzy_match_option(selected, options):
+    """Match a selected_option string to the closest valid option.
+    Returns the best matching option text, or the first option as fallback."""
+    if not selected or not options:
+        return options[0] if options else None
+    sel = str(selected).lower().strip()
+    # Try exact match first
+    for opt in options:
+        if opt.lower().strip() == sel:
+            return opt
+    # Try substring / contains match
+    for opt in options:
+        if sel in opt.lower() or opt.lower() in sel:
+            return opt
+    # Fuzzy match using SequenceMatcher
+    best_score = 0
+    best_opt = options[0]
+    for opt in options:
+        score = SequenceMatcher(None, sel, opt.lower().strip()).ratio()
+        if score > best_score:
+            best_score = score
+            best_opt = opt
+    return best_opt
 
 
 def format_questions_for_prompt(questions, seed=None):
@@ -819,14 +847,9 @@ def build_survey_analysis(responses, questions):
                 q_def = questions[qnum - 1]
                 selected = ans.get("selected_option")
 
-                # Validate MC selected_option against allowed options
-                if q_def["type"] == "mc" and selected:
-                    matched = None
-                    for opt in q_def["options"]:
-                        if opt.lower().strip() == str(selected).lower().strip():
-                            matched = opt
-                            break
-                    selected = matched if matched else selected
+                # Validate MC selected_option against allowed options (force to valid option)
+                if q_def["type"] == "mc":
+                    selected = _fuzzy_match_option(selected, q_def["options"])
 
                 rows.append({
                     "persona_id": resp["persona_id"],
@@ -888,12 +911,7 @@ def build_survey_analysis(responses, questions):
             option_counts = {}
             for opt in q_def["options"]:
                 option_counts[opt] = int((q_df["selected_option"] == opt).sum())
-            known = set(q_def["options"])
-            other_count = int(q_df["selected_option"].apply(
-                lambda x: x not in known if pd.notna(x) else False
-            ).sum())
-            if other_count > 0:
-                option_counts["(Other)"] = other_count
+
             pq["option_counts"] = option_counts
             pq["options"] = q_def["options"]
 
@@ -969,13 +987,8 @@ def build_advisor_survey_analysis(responses, questions):
             if 1 <= qnum <= len(questions):
                 q_def = questions[qnum - 1]
                 selected = ans.get("selected_option")
-                if q_def["type"] == "mc" and selected:
-                    matched = None
-                    for opt in q_def["options"]:
-                        if opt.lower().strip() == str(selected).lower().strip():
-                            matched = opt
-                            break
-                    selected = matched if matched else selected
+                if q_def["type"] == "mc":
+                    selected = _fuzzy_match_option(selected, q_def["options"])
 
                 rows.append({
                     "persona_id": resp["persona_id"],
@@ -1041,10 +1054,7 @@ def build_advisor_survey_analysis(responses, questions):
             option_counts = {}
             for opt in q_def["options"]:
                 option_counts[opt] = int((q_df["selected_option"] == opt).sum())
-            known = set(q_def["options"])
-            other_count = int((~q_df["selected_option"].isin(known) & q_df["selected_option"].notna()).sum())
-            if other_count > 0:
-                option_counts["(Other)"] = other_count
+
             pq["option_counts"] = option_counts
             pq["options"] = q_def["options"]
 
