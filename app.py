@@ -14,6 +14,7 @@ import re
 import random
 import os
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from urllib.request import urlopen, Request
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -483,6 +484,96 @@ def fetch_news_context(topic):
         return response.text.strip()
     except Exception as e:
         return f"Could not fetch news: {str(e)[:200]}"
+
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Simple HTML-to-text converter using stdlib."""
+    def __init__(self):
+        super().__init__()
+        self._text = []
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "noscript", "svg", "path"):
+            self._skip = True
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript", "svg", "path"):
+            self._skip = False
+        if tag in ("p", "div", "br", "h1", "h2", "h3", "h4", "li", "tr"):
+            self._text.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            self._text.append(data)
+
+    def get_text(self):
+        return "".join(self._text)
+
+
+def fetch_app_info_from_url(url):
+    """Fetch a webpage and extract app info using one Gemini call.
+    Returns dict with keys: app_name, description, features, pricing."""
+    try:
+        if not url.startswith("http"):
+            url = "https://" + url
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urlopen(req, timeout=15) as resp:
+            html_bytes = resp.read(500_000)  # Cap at 500KB
+            encoding = resp.headers.get_content_charset() or "utf-8"
+            html_text = html_bytes.decode(encoding, errors="replace")
+
+        # Strip HTML tags to get plain text
+        extractor = _HTMLTextExtractor()
+        extractor.feed(html_text)
+        page_text = extractor.get_text()
+
+        # Trim to ~8000 chars to stay within token budget
+        page_text = " ".join(page_text.split())[:8000]
+
+        if len(page_text.strip()) < 50:
+            return {"error": "Page returned very little text content. The site may block automated access."}
+
+        client = genai.Client(api_key=API_KEY)
+        extract_prompt = (
+            "Below is text extracted from a product/app landing page. "
+            "Extract the following information and respond ONLY with valid JSON:\n\n"
+            "{{\n"
+            '  "app_name": "<the name of the app or product>",\n'
+            '  "description": "<2-4 sentence description of what the app does, who it is for, and its value proposition>",\n'
+            '  "features": ["<feature 1>", "<feature 2>", ...],\n'
+            '  "pricing": "<pricing info if found, or empty string if not mentioned>"\n'
+            "}}\n\n"
+            "Extract at least 3 features. If the page is not clearly about an app or product, "
+            "do your best to identify the main offering and its capabilities.\n\n"
+            f"PAGE TEXT:\n{page_text}"
+        )
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=extract_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.2,
+                max_output_tokens=1000,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = response.text.strip()
+        if text.startswith("```"):
+            import re as _re
+            text = _re.sub(r"^```(?:json)?\s*", "", text)
+            text = _re.sub(r"\s*```$", "", text)
+        result = json.loads(text)
+        return result
+    except json.JSONDecodeError:
+        return {"error": "Could not parse the extracted information. Try a different URL."}
+    except Exception as e:
+        return {"error": f"Could not fetch URL: {str(e)[:300]}"}
 
 
 def render_context_panel(panel_key="consumer"):
@@ -3401,12 +3492,51 @@ def run_app_feedback_mode(personas, sample_size, is_advisor=False, panel_key="co
 
     context = render_context_panel(panel_key)
 
-    app_name = st.text_input("App Name", placeholder="e.g. WealthTrack, InvestEasy, FinanceHub...", key=f"{panel_key}_app_name")
+    # --- URL Auto-fill ---
+    url_key = f"{panel_key}_app_url"
+    name_key = f"{panel_key}_app_name"
+    desc_key = f"{panel_key}_app_desc"
+    feat_key = f"{panel_key}_app_features"
+    price_key = f"{panel_key}_app_pricing"
+
+    with st.expander("\U0001f310 Import from URL (Optional)", expanded=False):
+        st.caption("Paste a product or app landing page URL to auto-extract the name, description, features, and pricing.")
+        ucol1, ucol2 = st.columns([3, 1])
+        with ucol1:
+            app_url = st.text_input(
+                "URL",
+                key=f"{panel_key}_url_input",
+                placeholder="e.g. https://wealthsimple.com, https://myapp.com...",
+                label_visibility="collapsed",
+            )
+        with ucol2:
+            analyze_btn = st.button(
+                "\U0001f50d Analyze URL",
+                key=f"{panel_key}_analyze_url",
+                use_container_width=True,
+                disabled=not app_url.strip(),
+            )
+
+        if analyze_btn and app_url.strip():
+            with st.spinner("Fetching and analyzing page..."):
+                info = fetch_app_info_from_url(app_url.strip())
+            if "error" in info:
+                st.error(info["error"])
+            else:
+                st.session_state[name_key] = info.get("app_name", "")
+                st.session_state[desc_key] = info.get("description", "")
+                features = info.get("features", [])
+                st.session_state[feat_key] = "\n".join(features) if isinstance(features, list) else str(features)
+                st.session_state[price_key] = info.get("pricing", "")
+                st.success(f"Extracted info for **{info.get('app_name', 'Unknown')}** with {len(features)} features.")
+                st.rerun()
+
+    app_name = st.text_input("App Name", placeholder="e.g. WealthTrack, InvestEasy, FinanceHub...", key=name_key)
 
     app_description = st.text_area(
         "App Description", height=150,
         placeholder="Describe the app concept, target audience, and value proposition...",
-        key=f"{panel_key}_app_desc",
+        key=desc_key,
     )
 
     st.markdown("**Planned Features** (one per line)")
@@ -3414,13 +3544,13 @@ def run_app_feedback_mode(personas, sample_size, is_advisor=False, panel_key="co
         "Features", height=120,
         placeholder="e.g.\nAutomated portfolio rebalancing\nTax-loss harvesting\nGoal tracking dashboard\nSocial investing features\nFinancial literacy modules",
         label_visibility="collapsed",
-        key=f"{panel_key}_app_features",
+        key=feat_key,
     )
 
     pricing_info = st.text_input(
         "Pricing (optional)",
         placeholder="e.g. Free basic tier, $9.99/mo premium with advanced features",
-        key=f"{panel_key}_app_pricing",
+        key=price_key,
     )
 
     feature_names = [f.strip() for f in features_raw.strip().split("\n") if f.strip()]
