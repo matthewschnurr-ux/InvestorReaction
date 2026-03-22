@@ -100,6 +100,80 @@ Respond ONLY with valid JSON in this exact format (no markdown, no code fences):
 
 Include one entry in the "answers" array for each question, in order."""
 
+# ---------- APP FEEDBACK PROMPTS ----------
+
+APP_FEEDBACK_PROMPT = """You are roleplaying as this Canadian persona. Stay fully in character. Think and respond as this specific person would, given their background, financial situation, knowledge level, tech comfort, and life circumstances.
+
+PERSONA:
+{persona}
+{context}
+Evaluate the following app concept. Consider whether this app would be useful to YOU personally, given your life situation, tech comfort, financial situation, and daily needs.
+
+APP NAME: {app_name}
+
+APP DESCRIPTION:
+{app_description}
+
+PLANNED FEATURES:
+{features_list}
+
+PRICING:
+{pricing_info}
+
+From the features list above, pick your TOP 3 most valuable features (in order of importance to you) and your LEAST important feature. You MUST use the EXACT feature text from the list above, copied verbatim.
+
+Respond ONLY with valid JSON in this exact format (no markdown, no code fences):
+{{
+  "overall_reaction": "<positive|neutral|negative|mixed>",
+  "excitement_score": <integer 1-10>,
+  "download_intent": "<definitely|probably|maybe|unlikely|no>",
+  "usability_impression": "<very_easy|easy|moderate|confusing|very_confusing>",
+  "top_features": ["<most important feature>", "<2nd most important>", "<3rd most important>"],
+  "least_important_features": ["<feature you care about least>"],
+  "missing_features": ["<a feature you wish it had>"],
+  "pain_points": ["<concern1>", "<concern2>"],
+  "pricing_reaction": "<great_value|fair|expensive|too_expensive|need_more_info>",
+  "willing_to_pay": "<nothing|under_$5/mo|$5-$10/mo|$10-$20/mo|$20+/mo>",
+  "would_recommend_to_friends": <true or false>,
+  "verbatim_quote": "<2-3 sentences as if talking to a friend about this app>"
+}}"""
+
+ADVISOR_APP_FEEDBACK_PROMPT = """You are roleplaying as this Canadian financial advisor persona. Stay fully in character. Think and respond as this specific advisor would, given their professional background, designations, client base, practice focus, and years of experience.
+
+PERSONA:
+{persona}
+{context}
+Evaluate the following app concept FROM A PROFESSIONAL PERSPECTIVE. Consider whether this app would be useful to your clients, how it fits your practice, and whether you would recommend it.
+
+APP NAME: {app_name}
+
+APP DESCRIPTION:
+{app_description}
+
+PLANNED FEATURES:
+{features_list}
+
+PRICING:
+{pricing_info}
+
+From the features list above, pick your TOP 3 most valuable features for your clients (in order) and your LEAST important feature. You MUST use the EXACT feature text from the list above, copied verbatim.
+
+Respond ONLY with valid JSON in this exact format (no markdown, no code fences):
+{{
+  "overall_reaction": "<positive|neutral|negative|mixed>",
+  "excitement_score": <integer 1-10>,
+  "would_recommend_to_clients": <true or false>,
+  "client_suitability": "<unsuitable|niche|moderate|broad>",
+  "top_features": ["<most important feature>", "<2nd most important>", "<3rd most important>"],
+  "least_important_features": ["<feature you care about least>"],
+  "missing_features": ["<a feature clients would need>"],
+  "pain_points": ["<concern1>", "<concern2>"],
+  "pricing_reaction": "<great_value|fair|expensive|too_expensive|need_more_info>",
+  "compliance_concerns": ["<any regulatory or compliance concern>"],
+  "verbatim_quote": "<2-3 sentences as if talking to a colleague about this app>"
+}}"""
+
+
 # ---------- ADVISOR-SPECIFIC PROMPTS ----------
 
 ADVISOR_REACTION_PROMPT = """You are roleplaying as this Canadian financial advisor persona. Stay fully in character. Think and respond as this specific advisor would, given their professional background, designations, client base, practice focus, and years of experience.
@@ -782,6 +856,92 @@ def collect_survey_responses(personas, questions, is_advisor=False, context=""):
     return responses
 
 
+
+# ============================================================
+# API - APP FEEDBACK
+# ============================================================
+
+def get_app_feedback(client, persona, app_name, app_description, features_list, pricing_info, is_advisor=False, context=""):
+    prompt_template = ADVISOR_APP_FEEDBACK_PROMPT if is_advisor else APP_FEEDBACK_PROMPT
+    attach_fn = attach_advisor_metadata if is_advisor else attach_persona_metadata
+    ctx_block = f"\nCURRENT EVENTS CONTEXT (recent developments this persona would be aware of):\n{context}\n" if context else "\n"
+    prompt = prompt_template.format(
+        persona=persona["persona_summary"],
+        app_name=app_name,
+        app_description=app_description,
+        features_list=features_list,
+        pricing_info=pricing_info,
+        context=ctx_block,
+    )
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.8,
+                    max_output_tokens=1200,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            text = response.text.strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```(?:json)?\s*", "", text)
+                text = re.sub(r"\s*```$", "", text)
+            result = json.loads(text)
+            return attach_fn(result, persona)
+        except json.JSONDecodeError:
+            if attempt < 2:
+                time.sleep(1)
+                continue
+            return make_error_result(persona, "JSON parse error")
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                time.sleep((attempt + 1) * 10)
+                continue
+            if attempt < 2:
+                time.sleep(2)
+                continue
+            return make_error_result(persona, str(e)[:100])
+
+
+def collect_app_feedback(personas, app_name, app_description, features_list, pricing_info, is_advisor=False, context=""):
+    client = genai.Client(api_key=API_KEY)
+    total = len(personas)
+    results = []
+    completed = 0
+    errors = 0
+    delay = 60.0 / 450
+
+    progress_bar = st.progress(0, text=f"Starting app feedback... 0/{total}")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_persona = {}
+        for persona in personas:
+            future = executor.submit(
+                get_app_feedback, client, persona,
+                app_name, app_description, features_list, pricing_info,
+                is_advisor, context
+            )
+            future_to_persona[future] = persona
+            time.sleep(delay)
+
+        for future in as_completed(future_to_persona):
+            completed += 1
+            result = future.result()
+            results.append(result)
+            if "error" in result:
+                errors += 1
+            progress_bar.progress(
+                completed / total,
+                text=f"Collected {completed}/{total} responses ({errors} errors)"
+            )
+
+    progress_bar.progress(1.0, text=f"Done! {total} responses collected ({errors} errors)")
+    return results
+
+
 # ============================================================
 # ANALYSIS - REACTOR
 # ============================================================
@@ -1061,6 +1221,144 @@ def build_advisor_survey_analysis(responses, questions):
         per_question[qnum] = pq
 
     return df, per_question
+
+
+
+# ============================================================
+# ANALYSIS - APP FEEDBACK
+# ============================================================
+
+def build_app_feedback_analysis(responses, feature_names):
+    """Build analysis for consumer app feedback responses."""
+    valid = [r for r in responses if "error" not in r]
+    if not valid:
+        return None, None
+
+    df = pd.DataFrame(valid)
+    df["excitement_score"] = pd.to_numeric(df.get("excitement_score"), errors="coerce")
+    df["age"] = pd.to_numeric(df.get("age"), errors="coerce")
+    df["income"] = pd.to_numeric(df.get("income"), errors="coerce")
+    df["net_worth"] = pd.to_numeric(df.get("net_worth"), errors="coerce")
+
+    if "would_recommend_to_friends" not in df.columns:
+        df["would_recommend_to_friends"] = False
+    df["would_recommend_to_friends"] = df["would_recommend_to_friends"].fillna(False).astype(bool)
+
+    df["age_group"] = pd.cut(df["age"], bins=[0, 34, 54, 100], labels=["18-34", "35-54", "55+"])
+    df["income_bracket"] = pd.cut(
+        df["income"], bins=[0, 60000, 120000, float("inf")],
+        labels=["Under $60K", "$60K-$120K", "$120K+"]
+    )
+
+    feature_scores = Counter()
+    feature_first_place = Counter()
+    feature_least_important = Counter()
+    all_missing = []
+    all_pain_points = []
+
+    for _, row in df.iterrows():
+        top = row.get("top_features", [])
+        if isinstance(top, list):
+            for rank, feat in enumerate(top[:3]):
+                matched = _fuzzy_match_option(str(feat), feature_names)
+                weight = 3 - rank
+                feature_scores[matched] += weight
+                if rank == 0:
+                    feature_first_place[matched] += 1
+
+        least = row.get("least_important_features", [])
+        if isinstance(least, list):
+            for feat in least:
+                matched = _fuzzy_match_option(str(feat), feature_names)
+                feature_least_important[matched] += 1
+
+        missing = row.get("missing_features", [])
+        if isinstance(missing, list):
+            all_missing.extend([str(m) for m in missing])
+
+        pains = row.get("pain_points", [])
+        if isinstance(pains, list):
+            all_pain_points.extend([str(p) for p in pains])
+
+    analysis = {
+        "feature_scores": feature_scores.most_common(),
+        "feature_first_place": feature_first_place.most_common(),
+        "feature_least_important": feature_least_important.most_common(),
+        "missing_features": Counter(all_missing).most_common(15),
+        "pain_points": Counter(all_pain_points).most_common(15),
+    }
+
+    return df, analysis
+
+
+def build_advisor_app_feedback_analysis(responses, feature_names):
+    """Build analysis for advisor app feedback responses."""
+    valid = [r for r in responses if "error" not in r]
+    if not valid:
+        return None, None
+
+    df = pd.DataFrame(valid)
+    df["excitement_score"] = pd.to_numeric(df.get("excitement_score"), errors="coerce")
+    df["age"] = pd.to_numeric(df.get("age"), errors="coerce")
+    df["personal_income"] = pd.to_numeric(df.get("personal_income"), errors="coerce")
+    df["years_in_business"] = pd.to_numeric(df.get("years_in_business"), errors="coerce")
+    df["book_size_aum"] = pd.to_numeric(df.get("book_size_aum"), errors="coerce")
+
+    if "would_recommend_to_clients" not in df.columns:
+        df["would_recommend_to_clients"] = False
+    df["would_recommend_to_clients"] = df["would_recommend_to_clients"].fillna(False).astype(bool)
+
+    df["years_group"] = pd.cut(df["years_in_business"], bins=[-1, 5, 15, 100], labels=["Junior (0-5yr)", "Mid (6-15yr)", "Senior (16+yr)"])
+    df["book_size_group"] = pd.cut(
+        df["book_size_aum"], bins=[0, 50e6, 150e6, float("inf")],
+        labels=["Under $50M", "$50M-$150M", "$150M+"]
+    )
+
+    feature_scores = Counter()
+    feature_first_place = Counter()
+    feature_least_important = Counter()
+    all_missing = []
+    all_pain_points = []
+    all_compliance = []
+
+    for _, row in df.iterrows():
+        top = row.get("top_features", [])
+        if isinstance(top, list):
+            for rank, feat in enumerate(top[:3]):
+                matched = _fuzzy_match_option(str(feat), feature_names)
+                weight = 3 - rank
+                feature_scores[matched] += weight
+                if rank == 0:
+                    feature_first_place[matched] += 1
+
+        least = row.get("least_important_features", [])
+        if isinstance(least, list):
+            for feat in least:
+                matched = _fuzzy_match_option(str(feat), feature_names)
+                feature_least_important[matched] += 1
+
+        missing = row.get("missing_features", [])
+        if isinstance(missing, list):
+            all_missing.extend([str(m) for m in missing])
+
+        pains = row.get("pain_points", [])
+        if isinstance(pains, list):
+            all_pain_points.extend([str(p) for p in pains])
+
+        compliance = row.get("compliance_concerns", [])
+        if isinstance(compliance, list):
+            all_compliance.extend([str(c) for c in compliance])
+
+    analysis = {
+        "feature_scores": feature_scores.most_common(),
+        "feature_first_place": feature_first_place.most_common(),
+        "feature_least_important": feature_least_important.most_common(),
+        "missing_features": Counter(all_missing).most_common(15),
+        "pain_points": Counter(all_pain_points).most_common(15),
+        "compliance_concerns": Counter(all_compliance).most_common(15),
+    }
+
+    return df, analysis
 
 
 # ============================================================
@@ -1347,6 +1645,391 @@ def show_data(df, key_suffix=""):
         file_name=f"reactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
         key=f"download_csv{key_suffix}",
+    )
+
+
+
+# ============================================================
+# DISPLAY - APP FEEDBACK
+# ============================================================
+
+def show_app_feedback_overview(df, is_advisor=False):
+    st.subheader("Key Metrics")
+    col1, col2, col3, col4 = st.columns(4)
+    avg_score = df["excitement_score"].mean()
+    top_sentiment = df["overall_reaction"].mode().iloc[0] if not df["overall_reaction"].mode().empty else "N/A"
+
+    if is_advisor:
+        rec_pct = df["would_recommend_to_clients"].mean() * 100
+        col1.metric("Avg Excitement", f"{avg_score:.1f} / 10")
+        col2.metric("Would Recommend to Clients", f"{rec_pct:.0f}%")
+        col3.metric("Top Sentiment", top_sentiment.title())
+        if "client_suitability" in df.columns:
+            top_suit = df["client_suitability"].mode().iloc[0] if not df["client_suitability"].mode().empty else "N/A"
+            col4.metric("Client Suitability", top_suit.title())
+    else:
+        download_yes = df["download_intent"].isin(["definitely", "probably"]).mean() * 100
+        rec_pct = df["would_recommend_to_friends"].mean() * 100
+        col1.metric("Avg Excitement", f"{avg_score:.1f} / 10")
+        col2.metric("Would Download", f"{download_yes:.0f}%")
+        col3.metric("Top Sentiment", top_sentiment.title())
+        col4.metric("Would Recommend", f"{rec_pct:.0f}%")
+
+    st.divider()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.histogram(
+            df, x="excitement_score", nbins=10,
+            title="Excitement Score Distribution",
+            labels={"excitement_score": "Excitement Score", "count": "Count"},
+            color_discrete_sequence=["#2d5a87"],
+        )
+        fig.update_layout(bargap=0.1, yaxis_title="Count")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        sent_counts = df["overall_reaction"].value_counts()
+        fig = px.pie(
+            values=sent_counts.values, names=sent_counts.index,
+            title="Sentiment Breakdown",
+            color=sent_counts.index,
+            color_discrete_map=SENTIMENT_COLORS,
+        )
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig, use_container_width=True)
+
+    if not is_advisor and "download_intent" in df.columns:
+        dl_order = ["definitely", "probably", "maybe", "unlikely", "no"]
+        dl_counts = df["download_intent"].value_counts()
+        dl_df = pd.DataFrame({"Intent": dl_counts.index, "Count": dl_counts.values})
+        dl_df["sort_key"] = dl_df["Intent"].apply(lambda x: dl_order.index(x) if x in dl_order else 99)
+        dl_df = dl_df.sort_values("sort_key")
+        fig = px.bar(
+            dl_df, x="Intent", y="Count",
+            title="Download Intent",
+            color_discrete_sequence=["#2d5a87"],
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if "pricing_reaction" in df.columns:
+            pr_order = ["great_value", "fair", "expensive", "too_expensive", "need_more_info"]
+            pr_counts = df["pricing_reaction"].value_counts()
+            pr_df = pd.DataFrame({"Reaction": pr_counts.index, "Count": pr_counts.values})
+            pr_df["sort_key"] = pr_df["Reaction"].apply(lambda x: pr_order.index(x) if x in pr_order else 99)
+            pr_df = pr_df.sort_values("sort_key")
+            pr_df["Reaction"] = pr_df["Reaction"].str.replace("_", " ").str.title()
+            fig = px.bar(pr_df, x="Reaction", y="Count", title="Pricing Reaction", color_discrete_sequence=["#8e44ad"])
+            st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        if not is_advisor and "willing_to_pay" in df.columns:
+            wtp_order = ["nothing", "under_$5/mo", "$5-$10/mo", "$10-$20/mo", "$20+/mo"]
+            wtp_counts = df["willing_to_pay"].value_counts()
+            wtp_df = pd.DataFrame({"Amount": wtp_counts.index, "Count": wtp_counts.values})
+            wtp_df["sort_key"] = wtp_df["Amount"].apply(lambda x: wtp_order.index(x) if x in wtp_order else 99)
+            wtp_df = wtp_df.sort_values("sort_key")
+            fig = px.bar(wtp_df, x="Amount", y="Count", title="Willingness to Pay", color_discrete_sequence=["#27ae60"])
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def show_feature_ranking(df, analysis, feature_names, is_advisor=False):
+    st.subheader("Feature Ranking")
+
+    # Weighted score bar chart
+    if analysis["feature_scores"]:
+        feat_df = pd.DataFrame(analysis["feature_scores"], columns=["Feature", "Score"])
+        fig = px.bar(
+            feat_df, x="Score", y="Feature", orientation="h",
+            title="Feature Priority Score (1st=3pts, 2nd=2pts, 3rd=1pt)",
+            color_discrete_sequence=["#2d5a87"],
+        )
+        fig.update_layout(yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if analysis["feature_first_place"]:
+            fp_df = pd.DataFrame(analysis["feature_first_place"], columns=["Feature", "First Place Votes"])
+            fig = px.bar(fp_df, x="First Place Votes", y="Feature", orientation="h",
+                         title="#1 Feature Votes", color_discrete_sequence=["#27ae60"])
+            fig.update_layout(yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        if analysis["feature_least_important"]:
+            li_df = pd.DataFrame(analysis["feature_least_important"], columns=["Feature", "Least Important Votes"])
+            fig = px.bar(li_df, x="Least Important Votes", y="Feature", orientation="h",
+                         title="Least Important Feature Votes", color_discrete_sequence=["#e74c3c"])
+            fig.update_layout(yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Feature preference by demographics
+    st.subheader("Feature Preference by Demographics")
+    group_col = "years_group" if is_advisor else "age_group"
+    group_label = "Experience Group" if is_advisor else "Age Group"
+
+    if group_col in df.columns:
+        # Build cross-tab: which features each demographic picks
+        rows = []
+        for _, row in df.iterrows():
+            top = row.get("top_features", [])
+            if isinstance(top, list):
+                for feat in top[:3]:
+                    matched = _fuzzy_match_option(str(feat), feature_names)
+                    rows.append({group_col: row.get(group_col), "Feature": matched})
+        if rows:
+            cross_df = pd.DataFrame(rows)
+            cross_agg = cross_df.groupby([group_col, "Feature"], observed=True).size().reset_index(name="Count")
+            fig = px.bar(
+                cross_agg, x=group_col, y="Count", color="Feature",
+                title=f"Top Feature Picks by {group_label}",
+                barmode="group",
+                labels={group_col: group_label},
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Missing features
+    if analysis["missing_features"]:
+        st.subheader("Requested Missing Features")
+        for feat, count in analysis["missing_features"]:
+            st.markdown(f"- **{feat}** ({count} mentions)")
+
+
+def show_app_feedback_demographics(df, is_advisor=False):
+    st.subheader("Breakdown by Demographics")
+
+    if is_advisor:
+        group_col, group_label = "years_group", "Experience Group"
+        c1, c2 = st.columns(2)
+        with c1:
+            if group_col in df.columns:
+                stats = df.groupby(group_col, observed=True).agg(
+                    avg_score=("excitement_score", "mean"), count=("excitement_score", "count")
+                ).reset_index()
+                fig = px.bar(stats, x=group_col, y="avg_score", text="avg_score",
+                             title=f"Avg Excitement by {group_label}", color_discrete_sequence=["#2d5a87"],
+                             labels={group_col: group_label, "avg_score": "Avg Score"})
+                fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+                fig.update_layout(yaxis_range=[0, 10])
+                st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            if "book_size_group" in df.columns:
+                stats = df.groupby("book_size_group", observed=True).agg(
+                    avg_score=("excitement_score", "mean"), count=("excitement_score", "count")
+                ).reset_index()
+                fig = px.bar(stats, x="book_size_group", y="avg_score", text="avg_score",
+                             title="Avg Excitement by Book Size", color_discrete_sequence=["#2d5a87"],
+                             labels={"book_size_group": "Book Size (AUM)", "avg_score": "Avg Score"})
+                fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+                fig.update_layout(yaxis_range=[0, 10])
+                st.plotly_chart(fig, use_container_width=True)
+
+        if "firm_type" in df.columns:
+            stats = df.groupby("firm_type", observed=True).agg(
+                avg_score=("excitement_score", "mean"), count=("excitement_score", "count")
+            ).reset_index()
+            fig = px.bar(stats, x="firm_type", y="avg_score", text="avg_score",
+                         title="Avg Excitement by Firm Type", color_discrete_sequence=["#2d5a87"],
+                         labels={"firm_type": "Firm Type", "avg_score": "Avg Score"})
+            fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+            fig.update_layout(yaxis_range=[0, 10])
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            if "age_group" in df.columns:
+                stats = df.groupby("age_group", observed=True).agg(
+                    avg_score=("excitement_score", "mean"), count=("excitement_score", "count")
+                ).reset_index()
+                fig = px.bar(stats, x="age_group", y="avg_score", text="avg_score",
+                             title="Avg Excitement by Age Group", color_discrete_sequence=["#2d5a87"],
+                             labels={"age_group": "Age Group", "avg_score": "Avg Score"})
+                fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+                fig.update_layout(yaxis_range=[0, 10])
+                st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            if "income_bracket" in df.columns:
+                stats = df.groupby("income_bracket", observed=True).agg(
+                    avg_score=("excitement_score", "mean"), count=("excitement_score", "count")
+                ).reset_index()
+                fig = px.bar(stats, x="income_bracket", y="avg_score", text="avg_score",
+                             title="Avg Excitement by Income", color_discrete_sequence=["#2d5a87"],
+                             labels={"income_bracket": "Income Bracket", "avg_score": "Avg Score"})
+                fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+                fig.update_layout(yaxis_range=[0, 10])
+                st.plotly_chart(fig, use_container_width=True)
+
+        if "risk_tolerance_profile" in df.columns:
+            risk_order = ["Very Conservative", "Conservative", "Moderate", "Growth", "Aggressive"]
+            stats = df.groupby("risk_tolerance_profile", observed=True).agg(
+                avg_score=("excitement_score", "mean"), count=("excitement_score", "count")
+            ).reset_index()
+            stats["risk_tolerance_profile"] = pd.Categorical(stats["risk_tolerance_profile"], categories=risk_order, ordered=True)
+            stats = stats.sort_values("risk_tolerance_profile")
+            fig = px.bar(stats, x="risk_tolerance_profile", y="avg_score", text="avg_score",
+                         title="Avg Excitement by Risk Tolerance", color_discrete_sequence=["#e67e22"],
+                         labels={"risk_tolerance_profile": "Risk Profile", "avg_score": "Avg Score"})
+            fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+            fig.update_layout(yaxis_range=[0, 10])
+            st.plotly_chart(fig, use_container_width=True)
+
+        if "province" in df.columns:
+            prov_stats = df.groupby("province", observed=True).agg(
+                avg_score=("excitement_score", "mean"), count=("excitement_score", "count")
+            ).reset_index()
+            prov_stats = prov_stats[prov_stats["count"] >= 2].sort_values("avg_score", ascending=False)
+            if not prov_stats.empty:
+                fig = px.bar(prov_stats, x="province", y="avg_score", text="avg_score",
+                             title="Avg Excitement by Province (min 2 respondents)", color_discrete_sequence=["#2d5a87"],
+                             labels={"province": "Province", "avg_score": "Avg Score"})
+                fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+                fig.update_layout(yaxis_range=[0, 10])
+                st.plotly_chart(fig, use_container_width=True)
+
+
+def show_app_feedback_pain_points(df, analysis, is_advisor=False):
+    st.subheader("Pain Points & Pricing")
+
+    if analysis["pain_points"]:
+        pp_df = pd.DataFrame(analysis["pain_points"], columns=["Pain Point", "Mentions"])
+        fig = px.bar(pp_df, x="Mentions", y="Pain Point", orientation="h",
+                     title="Top Pain Points / Concerns", color_discrete_sequence=["#e74c3c"])
+        fig.update_layout(yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    if is_advisor and analysis.get("compliance_concerns"):
+        st.subheader("Compliance Concerns")
+        cc_df = pd.DataFrame(analysis["compliance_concerns"], columns=["Concern", "Mentions"])
+        fig = px.bar(cc_df, x="Mentions", y="Concern", orientation="h",
+                     title="Compliance & Regulatory Concerns", color_discrete_sequence=["#c0392b"])
+        fig.update_layout(yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    if "usability_impression" in df.columns:
+        ux_order = ["very_easy", "easy", "moderate", "confusing", "very_confusing"]
+        ux_counts = df["usability_impression"].value_counts()
+        ux_df = pd.DataFrame({"Impression": ux_counts.index, "Count": ux_counts.values})
+        ux_df["sort_key"] = ux_df["Impression"].apply(lambda x: ux_order.index(x) if x in ux_order else 99)
+        ux_df = ux_df.sort_values("sort_key")
+        ux_df["Impression"] = ux_df["Impression"].str.replace("_", " ").str.title()
+        fig = px.bar(ux_df, x="Impression", y="Count", title="Usability Impression",
+                     color_discrete_sequence=["#3498db"])
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def show_app_feedback_quotes(df, is_advisor=False, key_suffix=""):
+    st.subheader("Verbatim Feedback")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        filter_sentiment = st.selectbox("Filter by reaction", ["All", "positive", "negative", "neutral", "mixed"], key=f"app_quote_sent{key_suffix}")
+    with c2:
+        if is_advisor:
+            filter_rec = st.selectbox("Filter by would recommend", ["All", "Yes", "No"], key=f"app_quote_rec{key_suffix}")
+        else:
+            filter_dl = st.selectbox("Filter by download intent", ["All", "definitely", "probably", "maybe", "unlikely", "no"], key=f"app_quote_dl{key_suffix}")
+    with c3:
+        sort_by = st.selectbox("Sort by", ["Excitement (High to Low)", "Excitement (Low to High)", "Random"], key=f"app_quote_sort{key_suffix}")
+
+    filtered = df.copy()
+    if filter_sentiment != "All":
+        filtered = filtered[filtered["overall_reaction"] == filter_sentiment]
+    if is_advisor:
+        if filter_rec == "Yes":
+            filtered = filtered[filtered["would_recommend_to_clients"] == True]
+        elif filter_rec == "No":
+            filtered = filtered[filtered["would_recommend_to_clients"] == False]
+    else:
+        if filter_dl != "All":
+            filtered = filtered[filtered["download_intent"] == filter_dl]
+
+    if sort_by == "Excitement (High to Low)":
+        filtered = filtered.sort_values("excitement_score", ascending=False)
+    elif sort_by == "Excitement (Low to High)":
+        filtered = filtered.sort_values("excitement_score", ascending=True)
+    else:
+        filtered = filtered.sample(frac=1, random_state=42)
+
+    st.caption(f"Showing {min(len(filtered), 20)} of {len(filtered)} responses")
+
+    for _, row in filtered.head(20).iterrows():
+        score = row.get("excitement_score", "?")
+        reaction = row.get("overall_reaction", "?")
+        emoji = {"positive": ":green_circle:", "negative": ":red_circle:", "neutral": ":white_circle:", "mixed": ":orange_circle:"}.get(reaction, ":white_circle:")
+
+        if is_advisor:
+            label = f"{emoji} **{row.get('persona_name', 'N/A')}** | {row.get('firm_type', '')} | Score: {score}/10 | {reaction}"
+        else:
+            label = f"{emoji} **{row.get('persona_name', 'N/A')}** | Age {row.get('age', '?')}, {row.get('province', '')} | Score: {score}/10 | {reaction}"
+
+        with st.expander(label):
+            if is_advisor:
+                rec = "Yes" if row.get("would_recommend_to_clients") else "No"
+                suit = row.get("client_suitability", "N/A")
+                st.markdown(f"**Would recommend to clients:** {rec} | **Client suitability:** {suit}")
+            else:
+                dl = row.get("download_intent", "N/A")
+                rec = "Yes" if row.get("would_recommend_to_friends") else "No"
+                st.markdown(f"**Download intent:** {dl} | **Would recommend:** {rec}")
+
+            st.markdown(f"**Pricing reaction:** {row.get('pricing_reaction', 'N/A')}")
+            if not is_advisor:
+                st.markdown(f"**Willing to pay:** {row.get('willing_to_pay', 'N/A')}")
+
+            quote = row.get("verbatim_quote", "N/A")
+            st.markdown(f'> *"{quote}"*')
+
+            top = row.get("top_features", [])
+            if isinstance(top, list) and top:
+                st.markdown(f"**Top features:** {', '.join(str(f) for f in top)}")
+
+            pains = row.get("pain_points", [])
+            if isinstance(pains, list) and pains:
+                st.markdown(f"**Pain points:** {', '.join(str(p) for p in pains)}")
+
+            missing = row.get("missing_features", [])
+            if isinstance(missing, list) and missing:
+                st.markdown(f"**Missing features:** {', '.join(str(m) for m in missing)}")
+
+            if is_advisor:
+                compliance = row.get("compliance_concerns", [])
+                if isinstance(compliance, list) and compliance:
+                    st.markdown(f"**Compliance concerns:** {', '.join(str(c) for c in compliance)}")
+                st.caption(f"{row.get('designations', '')} | {row.get('practice_focus', '')} | {row.get('years_in_business', '')} yrs | AUM: ${row.get('book_size_aum', 0):,.0f}")
+            else:
+                st.caption(f"{row.get('life_stage', '')} | {row.get('education', '')} | Income: ${row.get('income', 0):,} | {row.get('risk_tolerance_profile', '')} risk")
+
+
+def show_app_feedback_data(df, is_advisor=False, key_suffix=""):
+    st.subheader("Raw Data")
+
+    if is_advisor:
+        display_cols = [
+            "persona_name", "age", "firm_type", "designations", "years_in_business",
+            "excitement_score", "overall_reaction", "would_recommend_to_clients", "client_suitability",
+            "pricing_reaction", "verbatim_quote",
+        ]
+    else:
+        display_cols = [
+            "persona_name", "age", "gender", "province", "income",
+            "excitement_score", "overall_reaction", "download_intent", "would_recommend_to_friends",
+            "pricing_reaction", "willing_to_pay", "verbatim_quote",
+        ]
+
+    available = [c for c in display_cols if c in df.columns]
+    st.dataframe(df[available].sort_values("excitement_score", ascending=False),
+                 use_container_width=True, height=500, key=f"app_data_table{key_suffix}")
+
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download Full Results as CSV",
+        data=csv,
+        file_name=f"app_feedback_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        key=f"app_download_csv{key_suffix}",
     )
 
 
@@ -2158,9 +2841,9 @@ def render_sidebar(consumer_personas, advisor_personas):
 
         mode = st.radio(
             "Mode",
-            ["Idea Reactor", "A/B Test", "Survey"],
-            horizontal=True,
-            help="Idea Reactor tests one idea. A/B Test compares two variants. Survey sends custom questions.",
+            ["Idea Reactor", "A/B Test", "Survey", "App Feedback"],
+            horizontal=False,
+            help="Idea Reactor tests one idea. A/B Test compares two variants. Survey sends custom questions. App Feedback evaluates an app concept.",
         )
 
         st.divider()
@@ -2707,6 +3390,123 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
 # ADMIN DASHBOARD
 # ============================================================
 
+
+def run_app_feedback_mode(personas, sample_size, is_advisor=False, panel_key="consumer"):
+    if is_advisor:
+        st.title("App Concept Feedback from Advisors")
+        st.markdown("Describe your app concept below and get professional feedback from a panel of Canadian financial advisors.")
+    else:
+        st.title("App Concept Feedback")
+        st.markdown("Describe your app concept below and get feedback from a demographically representative panel of Canadians.")
+
+    context = render_context_panel(panel_key)
+
+    app_name = st.text_input("App Name", placeholder="e.g. WealthTrack, InvestEasy, FinanceHub...", key=f"{panel_key}_app_name")
+
+    app_description = st.text_area(
+        "App Description", height=150,
+        placeholder="Describe the app concept, target audience, and value proposition...",
+        key=f"{panel_key}_app_desc",
+    )
+
+    st.markdown("**Planned Features** (one per line)")
+    features_raw = st.text_area(
+        "Features", height=120,
+        placeholder="e.g.\nAutomated portfolio rebalancing\nTax-loss harvesting\nGoal tracking dashboard\nSocial investing features\nFinancial literacy modules",
+        label_visibility="collapsed",
+        key=f"{panel_key}_app_features",
+    )
+
+    pricing_info = st.text_input(
+        "Pricing (optional)",
+        placeholder="e.g. Free basic tier, $9.99/mo premium with advanced features",
+        key=f"{panel_key}_app_pricing",
+    )
+
+    feature_names = [f.strip() for f in features_raw.strip().split("\n") if f.strip()]
+    features_formatted = "\n".join(f"{i+1}. {f}" for i, f in enumerate(feature_names))
+
+    can_run = app_name.strip() and app_description.strip() and len(feature_names) >= 2
+    panel_label = "advisors" if is_advisor else "personas"
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        run_button = st.button("Get App Feedback", type="primary", use_container_width=True, disabled=not can_run)
+    with col2:
+        if can_run:
+            st.caption(f"Will test against {sample_size} {panel_label} with {len(feature_names)} features")
+        elif feature_names and len(feature_names) < 2:
+            st.warning("Enter at least 2 features for meaningful prioritization.")
+
+    results_key = f"{panel_key}_app_feedback_results"
+    meta_key = f"{panel_key}_app_feedback_meta"
+
+    if run_button and can_run:
+        sample_fn = stratified_sample_advisors if is_advisor else stratified_sample
+        sampled = sample_fn(personas, sample_size)
+        st.info(f"Getting feedback from {len(sampled)} {panel_label}...")
+
+        with st.spinner("Collecting app feedback..."):
+            results = collect_app_feedback(
+                sampled, app_name.strip(), app_description.strip(),
+                features_formatted, pricing_info.strip() or "Not specified",
+                is_advisor=is_advisor, context=context
+            )
+
+        st.session_state[results_key] = results
+        st.session_state[meta_key] = {
+            "app_name": app_name.strip(),
+            "feature_names": feature_names,
+        }
+
+        errors = sum(1 for r in results if "error" in r)
+        valid = [r for r in results if "error" not in r]
+        avg_score = sum(r.get("excitement_score", 0) for r in valid) / len(valid) if valid else 0
+        log_usage({
+            "mode": "App Feedback",
+            "panel": panel_key,
+            "sample_size": len(sampled),
+            "api_calls": len(sampled),
+            "errors": errors,
+            "idea_preview": f"App: {app_name.strip()[:80]}",
+            "avg_interest_score": round(avg_score, 1),
+        })
+
+    if results_key in st.session_state:
+        results = st.session_state[results_key]
+        meta = st.session_state[meta_key]
+        feature_names_saved = meta["feature_names"]
+
+        build_fn = build_advisor_app_feedback_analysis if is_advisor else build_app_feedback_analysis
+        df, analysis = build_fn(results, feature_names_saved)
+
+        if df is None or df.empty:
+            st.error("No valid responses received. Check your API key and try again.")
+            return
+
+        st.divider()
+        st.header(f"Results: {meta['app_name']}")
+
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            "Overview", "Feature Ranking", "Demographics",
+            "Pain Points & Pricing", "Verbatim Quotes", "Raw Data"
+        ])
+        ks = "_adv" if is_advisor else ""
+
+        with tab1:
+            show_app_feedback_overview(df, is_advisor=is_advisor)
+        with tab2:
+            show_feature_ranking(df, analysis, feature_names_saved, is_advisor=is_advisor)
+        with tab3:
+            show_app_feedback_demographics(df, is_advisor=is_advisor)
+        with tab4:
+            show_app_feedback_pain_points(df, analysis, is_advisor=is_advisor)
+        with tab5:
+            show_app_feedback_quotes(df, is_advisor=is_advisor, key_suffix=ks)
+        with tab6:
+            show_app_feedback_data(df, is_advisor=is_advisor, key_suffix=ks)
+
+
 def run_admin_dashboard():
     st.title("📊 Usage Report")
     st.caption("Admin dashboard — persistent usage tracking across sessions")
@@ -2848,6 +3648,8 @@ def main():
         run_reactor_mode(personas, sample_size, is_advisor, panel_key)
     elif mode == "A/B Test":
         run_ab_test_mode(personas, sample_size, is_advisor, panel_key)
+    elif mode == "App Feedback":
+        run_app_feedback_mode(personas, sample_size, is_advisor, panel_key)
     else:
         run_survey_mode(personas, sample_size, is_advisor, panel_key)
 
