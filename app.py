@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from difflib import SequenceMatcher
 from datetime import datetime
+import io
 
 from google import genai
 from google.genai import types
@@ -510,6 +511,326 @@ def render_context_panel(panel_key="consumer"):
         )
 
     return context.strip()
+
+
+
+# ============================================================
+# EXCEL EXPORT
+# ============================================================
+
+def _counter_to_df(counter_list, col_name="Item", count_name="Count"):
+    """Convert Counter.most_common() list to a DataFrame."""
+    if not counter_list:
+        return pd.DataFrame({col_name: [], count_name: []})
+    return pd.DataFrame(counter_list, columns=[col_name, count_name])
+
+
+def _write_sheet(writer, sheet_name, df, index=False):
+    """Write a DataFrame to an Excel sheet, truncating sheet name if needed."""
+    # Excel sheet names limited to 31 chars
+    safe_name = sheet_name[:31]
+    df.to_excel(writer, sheet_name=safe_name, index=index)
+
+
+def build_excel_export_reactor(df, analysis, idea_text, is_advisor=False, idea_type="investment", context_text=""):
+    """Build a multi-sheet Excel workbook for Idea Reactor / General Idea results."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # --- Sheet 1: Summary ---
+        summary_rows = []
+        summary_rows.append(["Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+        summary_rows.append(["Mode", "Idea Reactor (Advisors)" if is_advisor else "Idea Reactor"])
+        summary_rows.append(["Idea Type", "General Idea" if idea_type == "general" else "Investment Idea"])
+        summary_rows.append(["Idea", idea_text])
+        if context_text:
+            summary_rows.append(["Current Events Context", context_text])
+        summary_rows.append(["Sample Size", len(df)])
+        summary_rows.append(["", ""])
+        summary_rows.append(["Key Metrics", ""])
+        summary_rows.append(["Avg Interest Score", round(df["interest_score"].mean(), 2)])
+        summary_rows.append(["Median Interest Score", round(df["interest_score"].median(), 2)])
+        if is_advisor:
+            summary_rows.append(["% Would Recommend", round(df["would_recommend"].mean() * 100, 1)])
+        else:
+            summary_rows.append(["% Would Invest / Try", round(df["would_invest"].mean() * 100, 1)])
+        top_sent = df["sentiment"].mode().iloc[0] if not df["sentiment"].mode().empty else "N/A"
+        summary_rows.append(["Top Sentiment", top_sent])
+        summary_rows.append(["", ""])
+        summary_rows.append(["Sentiment Breakdown", ""])
+        for s, c in df["sentiment"].value_counts().items():
+            summary_rows.append([f"  {s}", int(c)])
+        summary_df = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
+        _write_sheet(writer, "Summary", summary_df)
+
+        # --- Sheet 2: Raw Responses ---
+        if is_advisor:
+            resp_cols = [
+                "persona_name", "age", "gender", "province", "firm_type", "years_in_business",
+                "designations", "book_size_aum", "practice_focus", "personal_income",
+                "interest_score", "sentiment", "would_recommend", "client_suitability",
+                "gut_reaction", "verbatim_quote", "what_would_help",
+            ]
+        else:
+            resp_cols = [
+                "persona_name", "age", "gender", "province", "city", "income", "net_worth",
+                "risk_tolerance_profile", "life_stage", "investment_knowledge", "education",
+                "interest_score", "sentiment", "would_invest", "investment_amount",
+                "gut_reaction", "verbatim_quote", "what_would_help",
+            ]
+        available = [c for c in resp_cols if c in df.columns]
+        resp_df = df[available].copy().sort_values("interest_score", ascending=False)
+        _write_sheet(writer, "Raw Responses", resp_df)
+
+        # --- Sheet 3: Top Concerns ---
+        concerns_df = _counter_to_df(analysis.get("top_concerns", []), "Concern", "Mentions")
+        _write_sheet(writer, "Top Concerns", concerns_df)
+
+        # --- Sheet 4: Top Appeals ---
+        appeals_df = _counter_to_df(analysis.get("top_appeals", []), "Appeal Factor", "Mentions")
+        _write_sheet(writer, "Top Appeals", appeals_df)
+
+        # --- Sheet 5: What Would Help ---
+        helps = analysis.get("what_would_help", [])
+        helps_df = pd.DataFrame({"Suggestion": helps})
+        _write_sheet(writer, "What Would Help", helps_df)
+
+        # --- Sheet 6: By Age Group ---
+        if "age_group" in df.columns:
+            if is_advisor:
+                age_agg = df.groupby("age_group", observed=True).agg(
+                    avg_score=("interest_score", "mean"),
+                    would_recommend_pct=("would_recommend", lambda x: x.mean() * 100),
+                    count=("interest_score", "count"),
+                ).reset_index()
+            else:
+                age_agg = df.groupby("age_group", observed=True).agg(
+                    avg_score=("interest_score", "mean"),
+                    would_invest_pct=("would_invest", lambda x: x.mean() * 100),
+                    count=("interest_score", "count"),
+                ).reset_index()
+            _write_sheet(writer, "By Age Group", age_agg)
+
+        # --- Sheet 7: By Income ---
+        if "income_bracket" in df.columns:
+            if is_advisor:
+                inc_agg = df.groupby("income_bracket", observed=True).agg(
+                    avg_score=("interest_score", "mean"),
+                    would_recommend_pct=("would_recommend", lambda x: x.mean() * 100),
+                    count=("interest_score", "count"),
+                ).reset_index()
+            else:
+                inc_agg = df.groupby("income_bracket", observed=True).agg(
+                    avg_score=("interest_score", "mean"),
+                    would_invest_pct=("would_invest", lambda x: x.mean() * 100),
+                    count=("interest_score", "count"),
+                ).reset_index()
+            _write_sheet(writer, "By Income", inc_agg)
+
+        # --- Sheet 8: Advisor-specific or Risk-specific ---
+        if is_advisor and "years_group" in df.columns:
+            yr_agg = df.groupby("years_group", observed=True).agg(
+                avg_score=("interest_score", "mean"),
+                would_recommend_pct=("would_recommend", lambda x: x.mean() * 100),
+                count=("interest_score", "count"),
+            ).reset_index()
+            _write_sheet(writer, "By Experience", yr_agg)
+
+            if "book_size_group" in df.columns:
+                bs_agg = df.groupby("book_size_group", observed=True).agg(
+                    avg_score=("interest_score", "mean"),
+                    would_recommend_pct=("would_recommend", lambda x: x.mean() * 100),
+                    count=("interest_score", "count"),
+                ).reset_index()
+                _write_sheet(writer, "By Book Size", bs_agg)
+
+        elif not is_advisor and "risk_tolerance_profile" in df.columns:
+            risk_agg = df.groupby("risk_tolerance_profile", observed=True).agg(
+                avg_score=("interest_score", "mean"),
+                would_invest_pct=("would_invest", lambda x: x.mean() * 100),
+                count=("interest_score", "count"),
+            ).reset_index()
+            _write_sheet(writer, "By Risk Tolerance", risk_agg)
+
+        # --- Sheet 9: By Province ---
+        if "province" in df.columns:
+            prov_agg = df.groupby("province", observed=True).agg(
+                avg_score=("interest_score", "mean"),
+                count=("interest_score", "count"),
+            ).reset_index().sort_values("count", ascending=False)
+            _write_sheet(writer, "By Province", prov_agg)
+
+    return output.getvalue()
+
+
+def build_excel_export_ab(df_a, df_b, analysis_a, analysis_b, idea_a, idea_b, is_advisor=False, context_text=""):
+    """Build a multi-sheet Excel workbook for A/B Test results."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # --- Sheet 1: Comparison Summary ---
+        rows = []
+        rows.append(["Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+        rows.append(["Mode", "A/B Test (Advisors)" if is_advisor else "A/B Test"])
+        rows.append(["Variant A", idea_a])
+        rows.append(["Variant B", idea_b])
+        if context_text:
+            rows.append(["Current Events Context", context_text])
+        rows.append(["", ""])
+        rows.append(["Metric", "Variant A | Variant B"])
+
+        def _get_metric(name, val_a, val_b, fmt="{:.2f}"):
+            a_str = fmt.format(val_a) if val_a is not None else "N/A"
+            b_str = fmt.format(val_b) if val_b is not None else "N/A"
+            rows.append([name, f"{a_str}  |  {b_str}"])
+
+        if df_a is not None and not df_a.empty:
+            avg_a = df_a["interest_score"].mean()
+            med_a = df_a["interest_score"].median()
+        else:
+            avg_a = med_a = None
+        if df_b is not None and not df_b.empty:
+            avg_b = df_b["interest_score"].mean()
+            med_b = df_b["interest_score"].median()
+        else:
+            avg_b = med_b = None
+
+        _get_metric("Avg Interest Score", avg_a, avg_b)
+        _get_metric("Median Interest Score", med_a, med_b)
+
+        if is_advisor:
+            rec_a = df_a["would_recommend"].mean() * 100 if df_a is not None and not df_a.empty else None
+            rec_b = df_b["would_recommend"].mean() * 100 if df_b is not None and not df_b.empty else None
+            _get_metric("% Would Recommend", rec_a, rec_b, "{:.1f}%")
+        else:
+            inv_a = df_a["would_invest"].mean() * 100 if df_a is not None and not df_a.empty else None
+            inv_b = df_b["would_invest"].mean() * 100 if df_b is not None and not df_b.empty else None
+            _get_metric("% Would Invest / Try", inv_a, inv_b, "{:.1f}%")
+
+        summary_df = pd.DataFrame(rows, columns=["Item", "Value"])
+        _write_sheet(writer, "Comparison Summary", summary_df)
+
+        # --- Variant A & B Raw Data ---
+        if is_advisor:
+            resp_cols = [
+                "persona_name", "age", "gender", "province", "firm_type", "years_in_business",
+                "designations", "book_size_aum", "practice_focus",
+                "interest_score", "sentiment", "would_recommend", "client_suitability",
+                "gut_reaction", "verbatim_quote",
+            ]
+        else:
+            resp_cols = [
+                "persona_name", "age", "gender", "province", "income", "net_worth",
+                "risk_tolerance_profile", "life_stage", "investment_knowledge",
+                "interest_score", "sentiment", "would_invest", "investment_amount",
+                "gut_reaction", "verbatim_quote",
+            ]
+
+        if df_a is not None and not df_a.empty:
+            a_cols = [c for c in resp_cols if c in df_a.columns]
+            _write_sheet(writer, "Variant A Responses", df_a[a_cols].sort_values("interest_score", ascending=False))
+        if df_b is not None and not df_b.empty:
+            b_cols = [c for c in resp_cols if c in df_b.columns]
+            _write_sheet(writer, "Variant B Responses", df_b[b_cols].sort_values("interest_score", ascending=False))
+
+        # --- Concerns & Appeals for each variant ---
+        if analysis_a:
+            _write_sheet(writer, "A - Top Concerns", _counter_to_df(analysis_a.get("top_concerns", []), "Concern", "Mentions"))
+            _write_sheet(writer, "A - Top Appeals", _counter_to_df(analysis_a.get("top_appeals", []), "Appeal", "Mentions"))
+        if analysis_b:
+            _write_sheet(writer, "B - Top Concerns", _counter_to_df(analysis_b.get("top_concerns", []), "Concern", "Mentions"))
+            _write_sheet(writer, "B - Top Appeals", _counter_to_df(analysis_b.get("top_appeals", []), "Appeal", "Mentions"))
+
+    return output.getvalue()
+
+
+def build_excel_export_survey(df, per_question, questions, is_advisor=False, context_text=""):
+    """Build a multi-sheet Excel workbook for Survey results."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # --- Sheet 1: Summary ---
+        rows = []
+        rows.append(["Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+        rows.append(["Mode", "Survey (Advisors)" if is_advisor else "Survey"])
+        rows.append(["Respondents", df["persona_id"].nunique()])
+        rows.append(["Questions", len(questions)])
+        if context_text:
+            rows.append(["Current Events Context", context_text])
+        rows.append(["", ""])
+        rows.append(["Questions Summary", ""])
+        for i, q in enumerate(questions, 1):
+            q_type_label = "MC" if q["type"] == "mc" else "Open-Ended"
+            rows.append([f"Q{i} ({q_type_label})", q["text"]])
+            if q["type"] == "mc":
+                for opt in q.get("options", []):
+                    rows.append(["  Option", opt])
+        summary_df = pd.DataFrame(rows, columns=["Item", "Value"])
+        _write_sheet(writer, "Summary", summary_df)
+
+        # --- Sheet 2: All Responses (long format) ---
+        if is_advisor:
+            resp_cols = [
+                "persona_name", "age", "gender", "province", "firm_type", "years_in_business",
+                "designations", "book_size_aum", "practice_focus",
+                "question_number", "question_text", "question_type", "selected_option",
+                "answer", "sentiment", "confidence",
+            ]
+        else:
+            resp_cols = [
+                "persona_name", "age", "gender", "province", "income", "net_worth",
+                "risk_tolerance_profile", "life_stage", "investment_knowledge",
+                "question_number", "question_text", "question_type", "selected_option",
+                "answer", "sentiment", "confidence",
+            ]
+        available = [c for c in resp_cols if c in df.columns]
+        _write_sheet(writer, "All Responses", df[available].sort_values(["question_number", "persona_name"]))
+
+        # --- Per-question sheets ---
+        for qnum, pq in per_question.items():
+            q_def = questions[qnum - 1]
+            sheet_name = f"Q{qnum}"
+            qrows = []
+            qrows.append(["Question", q_def["text"]])
+            qrows.append(["Type", q_def["type"]])
+            qrows.append(["Responses", pq.get("response_count", 0)])
+            qrows.append(["", ""])
+            qrows.append(["Sentiment", "Count"])
+            for s, c in pq.get("sentiment_counts", {}).items():
+                qrows.append([s, int(c)])
+            qrows.append(["", ""])
+            qrows.append(["Confidence", "Count"])
+            for s, c in pq.get("confidence_counts", {}).items():
+                qrows.append([s, int(c)])
+
+            if q_def["type"] == "mc" and "option_counts" in pq:
+                qrows.append(["", ""])
+                qrows.append(["Option", "Selections"])
+                for opt, count in pq["option_counts"].items():
+                    qrows.append([opt, int(count)])
+
+            themes = pq.get("top_themes", [])
+            if themes:
+                qrows.append(["", ""])
+                qrows.append(["Top Theme", "Mentions"])
+                for t, c in themes:
+                    qrows.append([t, int(c)])
+
+            q_df = pd.DataFrame(qrows, columns=["Item", "Value"])
+            _write_sheet(writer, sheet_name, q_df)
+
+    return output.getvalue()
+
+
+def render_excel_export_button(label, excel_bytes, filename_prefix, key):
+    """Render a styled download button for Excel export."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.download_button(
+        label=f"📊  {label}",
+        data=excel_bytes,
+        file_name=f"{filename_prefix}_{timestamp}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=key,
+        type="primary",
+        use_container_width=False,
+    )
 
 
 # ============================================================
@@ -2330,6 +2651,7 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
 
         st.session_state[reactions_key] = reactions
         st.session_state[idea_key] = idea.strip()
+        st.session_state[f"{panel_key}_idea_type_saved"] = idea_type_key
 
         errors = sum(1 for r in reactions if "error" in r)
         valid = [r for r in reactions if "error" not in r]
@@ -2357,6 +2679,24 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
         st.header("Results")
         idea_text = st.session_state.get(idea_key, "")
         st.caption(f"Idea: *{idea_text[:150]}...*" if len(idea_text) > 150 else f"Idea: *{idea_text}*")
+
+        # Excel export
+        try:
+            _idea_type = st.session_state.get(f"{panel_key}_idea_type_saved", "investment")
+            excel_bytes = build_excel_export_reactor(
+                df, analysis, idea_text,
+                is_advisor=is_advisor,
+                idea_type=_idea_type,
+                context_text=st.session_state.get(f"{panel_key}_context_area", ""),
+            )
+            render_excel_export_button(
+                "Export All Results to Excel",
+                excel_bytes,
+                f"idea_reactor_{panel_key}",
+                key=f"{panel_key}_export_reactor",
+            )
+        except Exception as _e:
+            st.caption(f"Excel export unavailable: {str(_e)[:100]}")
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "Overview", "Demographics", "Insights", "Verbatim Quotes", "Raw Data"
@@ -2640,6 +2980,23 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
         st.divider()
         st.header("A/B Test Results")
 
+        # Excel export
+        try:
+            excel_bytes = build_excel_export_ab(
+                df_a, df_b, analysis_a, analysis_b,
+                idea_a_text, idea_b_text,
+                is_advisor=is_advisor,
+                context_text=st.session_state.get(f"{panel_key}_context_area", ""),
+            )
+            render_excel_export_button(
+                "Export A/B Test Results to Excel",
+                excel_bytes,
+                f"ab_test_{panel_key}",
+                key=f"{panel_key}_export_ab",
+            )
+        except Exception as _e:
+            st.caption(f"Excel export unavailable: {str(_e)[:100]}")
+
         tab1, tab2, tab3 = st.tabs(["Comparison", "Variant A Detail", "Variant B Detail"])
 
         with tab1:
@@ -2754,6 +3111,22 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
         st.divider()
         st.header("Survey Results")
         st.caption(f"{df['persona_id'].nunique()} respondents, {len(questions)} questions")
+
+        # Excel export
+        try:
+            excel_bytes = build_excel_export_survey(
+                df, per_question, questions,
+                is_advisor=is_advisor,
+                context_text=st.session_state.get(f"{panel_key}_context_area", ""),
+            )
+            render_excel_export_button(
+                "Export Survey Results to Excel",
+                excel_bytes,
+                f"survey_{panel_key}",
+                key=f"{panel_key}_export_survey",
+            )
+        except Exception as _e:
+            st.caption(f"Excel export unavailable: {str(_e)[:100]}")
 
         tab1, tab2, tab3, tab4 = st.tabs([
             "Overview", "Per-Question Analysis", "Individual Responses", "Raw Data & Export"
