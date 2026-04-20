@@ -36,6 +36,8 @@ MODEL_NAME = "gemini-3.1-flash-lite-preview"
 MAX_WORKERS = 10
 PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "personas.json")
 ADVISOR_PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "advisor_personas.json")
+RBC_DS_PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "rbc_ds_personas.json")
+RBC_PIM_PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "rbc_pim_personas.json")
 USAGE_LOG_FILE = os.path.join(os.path.dirname(__file__), "usage_log.json")
 ADMIN_SECRET = st.secrets.get("ADMIN_KEY", "persona-reactor-admin-2024")
 COST_PER_API_CALL = 0.0001  # Estimated cost per Gemini Flash-Lite call (USD)
@@ -880,6 +882,24 @@ def load_advisor_personas():
         return json.load(f)
 
 
+def load_rbc_ds_personas():
+    """Load all RBC Dominion Securities advisor personas."""
+    try:
+        with open(RBC_DS_PERSONAS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
+def load_rbc_pim_personas():
+    """Load RBC DS advisors who are PIM / Discretionary licensed."""
+    try:
+        with open(RBC_PIM_PERSONAS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
 # ============================================================
 # USAGE LOGGING
 # ============================================================
@@ -950,6 +970,35 @@ def stratified_sample_advisors(personas, n):
     return sampled[:n]
 
 
+def stratified_sample_rbc(personas, n):
+    """Stratified sample for RBC advisors by province x years_group x pim_licensed."""
+    rng = random.Random(42)
+    if n >= len(personas):
+        return personas
+    strata = {}
+    for p in personas:
+        yrs = p.get("years_in_business", 15)
+        years_group = "junior" if yrs <= 5 else ("mid" if yrs <= 15 else "senior")
+        prov = p.get("province", "Unknown")
+        # Collapse small provinces to keep strata balanced
+        major_provs = {"Ontario", "British Columbia", "Quebec", "Alberta"}
+        prov_key = prov if prov in major_provs else "Other"
+        pim = p.get("pim_licensed", "Unknown")
+        key = (prov_key, years_group, pim)
+        strata.setdefault(key, []).append(p)
+    sampled = []
+    total = len(personas)
+    for members in strata.values():
+        stratum_n = max(1, round(len(members) / total * n))
+        sampled.extend(rng.sample(members, min(stratum_n, len(members))))
+    if len(sampled) > n:
+        sampled = rng.sample(sampled, n)
+    elif len(sampled) < n:
+        remaining = [p for p in personas if p not in sampled]
+        sampled.extend(rng.sample(remaining, min(n - len(sampled), len(remaining))))
+    return sampled[:n]
+
+
 def attach_persona_metadata(result, persona):
     """Attach persona demographic metadata to an API result."""
     result["persona_id"] = persona["id"]
@@ -970,25 +1019,34 @@ def attach_persona_metadata(result, persona):
 
 
 def attach_advisor_metadata(result, persona):
-    """Attach advisor persona metadata to an API result."""
-    result["persona_id"] = persona["id"]
-    result["persona_name"] = f"{persona['first_name']} {persona['last_name']}"
-    result["age"] = persona["age"]
-    result["gender"] = persona["gender"]
-    result["province"] = persona["province"]
-    result["city"] = persona["city"]
-    result["firm_type"] = persona["firm_type"]
-    result["years_in_business"] = persona["years_in_business"]
-    result["designations"] = ", ".join(persona["designations"]) if isinstance(persona["designations"], list) else persona["designations"]
-    result["book_size_aum"] = persona["book_size_aum"]
-    result["num_clients"] = persona["num_clients"]
-    result["practice_focus"] = persona["practice_focus"]
-    result["compensation_model"] = persona["compensation_model"]
-    result["personal_income"] = persona["personal_income"]
-    result["business_maturity"] = persona["business_maturity"]
-    result["client_demographics"] = persona["client_demographics"]
-    result["education"] = persona["education"]
+    """Attach advisor persona metadata to an API result. Handles real advisor
+    records (e.g. RBC DS) that may not include every synthetic field."""
+    result["persona_id"] = persona.get("id", 0)
+    fn = persona.get("first_name", "")
+    ln = persona.get("last_name", "")
+    result["persona_name"] = f"{fn} {ln}".strip() or "Unknown"
+    result["age"] = persona.get("age", 0)
+    result["gender"] = persona.get("gender", "Unknown")
+    result["province"] = persona.get("province", "Unknown")
+    result["city"] = persona.get("city", "Unknown")
+    result["firm_type"] = persona.get("firm_type", "Unknown")
+    result["years_in_business"] = persona.get("years_in_business", 0)
+    designations = persona.get("designations", [])
+    result["designations"] = ", ".join(designations) if isinstance(designations, list) else (designations or "")
+    result["book_size_aum"] = persona.get("book_size_aum", 0)
+    result["num_clients"] = persona.get("num_clients", 0)
+    result["practice_focus"] = persona.get("practice_focus", "")
+    result["compensation_model"] = persona.get("compensation_model", "")
+    result["personal_income"] = persona.get("personal_income", 0)
+    result["business_maturity"] = persona.get("business_maturity", "")
+    result["client_demographics"] = persona.get("client_demographics", "")
+    result["education"] = persona.get("education", "")
     result["family_status"] = persona.get("family_status", "")
+    # RBC-specific
+    if "pim_licensed" in persona:
+        result["pim_licensed"] = persona["pim_licensed"]
+    if "title" in persona:
+        result["title"] = persona["title"]
     return result
 
 
@@ -2520,7 +2578,7 @@ def show_advisor_survey_data(df, key_suffix=""):
 # SIDEBAR
 # ============================================================
 
-def render_sidebar(consumer_personas, advisor_personas):
+def render_sidebar(consumer_personas, advisor_personas, rbc_ds_personas, rbc_pim_personas):
     with st.sidebar:
         st.title("Synthetic Persona Reactor")
         st.caption("Test ideas, run surveys and do A/B testing against investor and advisor personas")
@@ -2528,9 +2586,14 @@ def render_sidebar(consumer_personas, advisor_personas):
 
         panel = st.radio(
             "Panel",
-            ["Canadians as a Whole", "Financial Advisors"],
-            horizontal=True,
-            help="Choose which persona panel to test against.",
+            ["Canadians as a Whole", "Financial Advisors", "RBC DS - All", "RBC DS - PIM Licensed"],
+            horizontal=False,
+            help=(
+                "Canadians as a Whole: 1000 synthetic Canadian investors. "
+                "Financial Advisors: 1000 synthetic Canadian advisors. "
+                "RBC DS - All: real RBC Dominion Securities advisor panel (from public sources). "
+                "RBC DS - PIM Licensed: subset of RBC DS advisors with discretionary licence."
+            ),
         )
 
         st.divider()
@@ -2544,7 +2607,16 @@ def render_sidebar(consumer_personas, advisor_personas):
 
         st.divider()
 
-        personas = consumer_personas if panel == "Canadians as a Whole" else advisor_personas
+        if panel == "Canadians as a Whole":
+            personas = consumer_personas
+        elif panel == "Financial Advisors":
+            personas = advisor_personas
+        elif panel == "RBC DS - All":
+            personas = rbc_ds_personas
+        elif panel == "RBC DS - PIM Licensed":
+            personas = rbc_pim_personas
+        else:
+            personas = consumer_personas
 
         sample_size = st.slider(
             "Sample Size",
@@ -2567,6 +2639,38 @@ def render_sidebar(consumer_personas, advisor_personas):
                 st.caption("**Ethnicities:**")
                 for eth, count in ethnicities.most_common(6):
                     st.caption(f"  {eth}: {count} ({count/len(personas)*100:.0f}%)")
+            elif panel in ("RBC DS - All", "RBC DS - PIM Licensed"):
+                st.caption(f"**Total advisors available:** {len(personas)}")
+                provinces = Counter(p.get("province", "Unknown") for p in personas)
+                st.caption("**Top provinces:**")
+                for prov, count in provinces.most_common(8):
+                    st.caption(f"  {prov}: {count} ({count/len(personas)*100:.0f}%)")
+                if panel == "RBC DS - All":
+                    pim_counts = Counter(p.get("pim_licensed", "Unknown") for p in personas)
+                    st.caption("**PIM / Discretionary:**")
+                    for pim, count in pim_counts.most_common():
+                        label = {"Y": "PIM Licensed", "N": "Non-PIM", "Unknown": "Unclassified"}.get(pim, pim)
+                        st.caption(f"  {label}: {count} ({count/len(personas)*100:.0f}%)")
+                years = [p.get("years_in_business", 0) for p in personas]
+                yrs_groups = Counter(("Junior (0-5)" if y <= 5 else "Mid (6-15)" if y <= 15 else "Senior (16+)") for y in years)
+                st.caption("**Experience (est.):**")
+                for g, count in yrs_groups.most_common():
+                    st.caption(f"  {g}: {count} ({count/len(personas)*100:.0f}%)")
+                # Top practice focus
+                focuses = Counter(p.get("practice_focus", "") for p in personas if p.get("practice_focus"))
+                if focuses:
+                    st.caption("**Top practice focus areas:**")
+                    for focus, count in focuses.most_common(5):
+                        if focus:
+                            st.caption(f"  {focus[:60]}: {count}")
+                designations_flat = Counter()
+                for p in personas:
+                    for d in (p.get("designations") or []):
+                        designations_flat[d] += 1
+                if designations_flat:
+                    st.caption("**Top designations:**")
+                    for des, count in designations_flat.most_common(6):
+                        st.caption(f"  {des}: {count} ({count/len(personas)*100:.0f}%)")
             else:
                 st.caption(f"**Total advisors available:** {len(personas)}")
                 ages = [p["age"] for p in personas]
@@ -2604,21 +2708,35 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
     )
     idea_type_key = "investment" if idea_type == "Investment Idea" else "general"
 
+    # Determine the panel label for titles
+    if panel_key == "rbc_pim":
+        advisor_audience = "RBC DS PIM-Licensed Advisors"
+    elif panel_key == "rbc_ds":
+        advisor_audience = "RBC Dominion Securities Advisors"
+    else:
+        advisor_audience = "Canadian Financial Advisors"
+
     if idea_type_key == "general":
         if is_advisor:
-            st.title("Test Your Idea with Financial Advisors")
-            st.markdown("Describe your idea below and get professional reactions from a panel of Canadian financial advisors.")
+            st.title(f"Test Your Idea with {advisor_audience}")
+            st.markdown(f"Describe your idea below — e.g. an event concept, a piece of content, a new offering — and get professional reactions from a panel of {advisor_audience}.")
         else:
             st.title("Test Your Idea")
             st.markdown("Describe your idea below and get reactions from a demographically representative panel of Canadians.")
         idea_label = "Your Idea / Concept / Proposal"
-        placeholder = "Example: A community-based car sharing program for suburban neighbourhoods, where residents share vehicles through a mobile app with insurance included..."
+        if panel_key in ("rbc_ds", "rbc_pim"):
+            placeholder = "Example: A half-day event featuring a Bank of Canada economist, a private equity fund manager, and a tax planning expert — aimed at UHNW client prospecting..."
+        else:
+            placeholder = "Example: A community-based car sharing program for suburban neighbourhoods, where residents share vehicles through a mobile app with insurance included..."
     else:
         if is_advisor:
-            st.title("Test Your Idea with Financial Advisors")
-            st.markdown("Describe your idea below and get professional reactions from a panel of Canadian financial advisors.")
+            st.title(f"Test Your Idea with {advisor_audience}")
+            st.markdown(f"Describe your idea below and get professional reactions from a panel of {advisor_audience}.")
             idea_label = "Idea / Product / Concept"
-            placeholder = "Example: A new alternative investment platform offering private credit and real estate debt funds with quarterly liquidity, targeting accredited investors with $100K+ minimums..."
+            if panel_key in ("rbc_ds", "rbc_pim"):
+                placeholder = "Example: A new alternative investment platform offering private credit and real estate debt funds with quarterly liquidity, aimed at discretionary PIM books..."
+            else:
+                placeholder = "Example: A new alternative investment platform offering private credit and real estate debt funds with quarterly liquidity, targeting accredited investors with $100K+ minimums..."
         else:
             st.title("Test Your Investment Idea")
             st.markdown("Describe your investment idea below and get reactions from a demographically representative panel of Canadian investors.")
@@ -2641,7 +2759,7 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
     idea_key = f"{panel_key}_idea"
 
     if run_button and idea.strip():
-        sample_fn = stratified_sample_advisors if is_advisor else stratified_sample
+        sample_fn = (stratified_sample_rbc if panel_key in ("rbc_ds", "rbc_pim") else (stratified_sample_advisors if is_advisor else stratified_sample))
         sampled = sample_fn(personas, sample_size)
         panel_label = "advisors" if is_advisor else "personas"
         st.info(f"Testing against {len(sampled)} {panel_label} (stratified sample from {len(personas)})")
@@ -2936,7 +3054,7 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
     idb_key = f"{panel_key}_ab_idea_b"
 
     if run_button and both_filled:
-        sample_fn = stratified_sample_advisors if is_advisor else stratified_sample
+        sample_fn = (stratified_sample_rbc if panel_key in ("rbc_ds", "rbc_pim") else (stratified_sample_advisors if is_advisor else stratified_sample))
         sampled = sample_fn(personas, sample_size)
         st.info(f"Testing both variants against {len(sampled)} {panel_label}...")
 
@@ -3050,7 +3168,13 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
 # ============================================================
 
 def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer"):
-    if is_advisor:
+    if panel_key == "rbc_pim":
+        st.title("Survey the RBC DS PIM-Licensed Panel")
+        st.markdown("Build your survey below. Great for open-ended questions like \"what content would you want to see at an event?\" or \"what are the best 5 strategies to prospect this group?\"")
+    elif panel_key == "rbc_ds":
+        st.title("Survey the RBC Dominion Securities Panel")
+        st.markdown("Build your survey below. Great for open-ended questions like \"what content would you want to see at an event?\" or \"what are the best 5 strategies to prospect this group?\"")
+    elif is_advisor:
         st.title("Survey Your Advisor Panel")
         st.markdown("Build your survey below. Add open-ended or multiple-choice questions using the buttons.")
     else:
@@ -3073,7 +3197,7 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
     q_key = f"{panel_key}_survey_questions"
 
     if run_button and questions:
-        sample_fn = stratified_sample_advisors if is_advisor else stratified_sample
+        sample_fn = (stratified_sample_rbc if panel_key in ("rbc_ds", "rbc_pim") else (stratified_sample_advisors if is_advisor else stratified_sample))
         sampled = sample_fn(personas, sample_size)
         st.info(f"Surveying {len(sampled)} {panel_label} with {len(questions)} questions...")
 
@@ -3292,10 +3416,22 @@ def main():
 
     consumer_personas = load_personas()
     advisor_personas = load_advisor_personas()
-    sample_size, mode, panel, personas = render_sidebar(consumer_personas, advisor_personas)
+    rbc_ds_personas = load_rbc_ds_personas()
+    rbc_pim_personas = load_rbc_pim_personas()
+    sample_size, mode, panel, personas = render_sidebar(
+        consumer_personas, advisor_personas, rbc_ds_personas, rbc_pim_personas
+    )
 
-    is_advisor = (panel == "Financial Advisors")
-    panel_key = "advisor" if is_advisor else "consumer"
+    advisor_panels = {"Financial Advisors", "RBC DS - All", "RBC DS - PIM Licensed"}
+    is_advisor = panel in advisor_panels
+    if panel == "Financial Advisors":
+        panel_key = "advisor"
+    elif panel == "RBC DS - All":
+        panel_key = "rbc_ds"
+    elif panel == "RBC DS - PIM Licensed":
+        panel_key = "rbc_pim"
+    else:
+        panel_key = "consumer"
 
     if mode == "Idea Reactor":
         run_reactor_mode(personas, sample_size, is_advisor, panel_key)
