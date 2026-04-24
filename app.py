@@ -58,33 +58,33 @@ MODEL_CONFIGS = {
         "input_cost_per_1m": 0.075,
         "output_cost_per_1m": 0.30,
     },
-    "gemini-3-pro-preview": {
+    "gemini-2.5-pro": {
         "provider": "google",
-        "label": "Gemini 3 Pro",
+        "label": "Gemini 2.5 Pro",
         "tier": "Higher cost",
         "description": "Google's flagship reasoning model. More nuanced persona responses, better at complex reasoning.",
         "input_cost_per_1m": 1.25,
-        "output_cost_per_1m": 5.00,
-    },
-    "gpt-5-mini": {
-        "provider": "openai",
-        "label": "GPT-5 Mini",
-        "tier": "Low cost",
-        "description": "OpenAI's compact model. Fast and capable for persona role-play.",
-        "input_cost_per_1m": 0.25,
-        "output_cost_per_1m": 2.00,
-    },
-    "gpt-5": {
-        "provider": "openai",
-        "label": "GPT-5",
-        "tier": "Higher cost",
-        "description": "OpenAI's flagship model. Best for complex persona reasoning and detailed responses.",
-        "input_cost_per_1m": 1.25,
         "output_cost_per_1m": 10.00,
     },
-    "claude-haiku-4-6": {
+    "gpt-4o-mini": {
+        "provider": "openai",
+        "label": "GPT-4o Mini",
+        "tier": "Low cost",
+        "description": "OpenAI's compact model. Fast, capable, and well-behaved for persona role-play.",
+        "input_cost_per_1m": 0.15,
+        "output_cost_per_1m": 0.60,
+    },
+    "gpt-4o": {
+        "provider": "openai",
+        "label": "GPT-4o",
+        "tier": "Higher cost",
+        "description": "OpenAI's flagship multimodal model. Strong reasoning, natural persona voices.",
+        "input_cost_per_1m": 2.50,
+        "output_cost_per_1m": 10.00,
+    },
+    "claude-haiku-4-5": {
         "provider": "anthropic",
-        "label": "Claude Haiku 4.6",
+        "label": "Claude Haiku 4.5",
         "tier": "Low cost",
         "description": "Anthropic's fast model. Strong at nuanced persona role-play with tight, on-character responses.",
         "input_cost_per_1m": 1.00,
@@ -1342,10 +1342,13 @@ def call_llm(prompt, model_id=None, response_json=True, max_tokens=1000, tempera
 
     if provider == "google":
         client = genai.Client(api_key=GEMINI_API_KEY)
+        # Gemini "pro" tier models require a non-zero thinking budget;
+        # flash/lite models work with budget=0 (faster, cheaper).
+        thinking_budget = 256 if "pro" in model_id.lower() else 0
         gen_cfg_kwargs = {
             "temperature": temperature,
             "max_output_tokens": max_tokens,
-            "thinking_config": types.ThinkingConfig(thinking_budget=0),
+            "thinking_config": types.ThinkingConfig(thinking_budget=thinking_budget),
         }
         if response_json:
             gen_cfg_kwargs["response_mime_type"] = "application/json"
