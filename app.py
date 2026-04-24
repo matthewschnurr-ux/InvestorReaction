@@ -21,6 +21,16 @@ from collections import Counter
 from difflib import SequenceMatcher
 from datetime import datetime
 import io
+import base64
+from io import BytesIO
+
+# Optional: wordcloud for visualization (graceful fallback if not installed)
+try:
+    from wordcloud import WordCloud, STOPWORDS as WC_STOPWORDS
+    WORDCLOUD_AVAILABLE = True
+except Exception:
+    WORDCLOUD_AVAILABLE = False
+    WC_STOPWORDS = set()
 
 from google import genai
 from google.genai import types
@@ -29,10 +39,86 @@ from google.genai import types
 # CONFIG
 # ============================================================
 
-# API key loaded from .streamlit/secrets.toml (local) or Streamlit Cloud secrets
+# API keys loaded from .streamlit/secrets.toml (local) or Streamlit Cloud secrets
 API_KEY = st.secrets["GEMINI_API_KEY"]
+GEMINI_API_KEY = API_KEY  # alias for clarity
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
 
-MODEL_NAME = "gemini-3.1-flash-lite-preview"
+MODEL_NAME = "gemini-3.1-flash-lite-preview"  # default for utility calls (news summarization, etc.)
+
+# Model catalog: 2 models per provider (low cost + higher cost) for persona testing.
+# Costs are USD per 1M tokens (input / output) and are best estimates - verify with provider pricing pages.
+MODEL_CONFIGS = {
+    "gemini-3.1-flash-lite-preview": {
+        "provider": "google",
+        "label": "Gemini 3.1 Flash-Lite",
+        "tier": "Low cost",
+        "description": "Google's fastest model. Cheap and quick. Good baseline for high-volume persona testing.",
+        "input_cost_per_1m": 0.075,
+        "output_cost_per_1m": 0.30,
+    },
+    "gemini-3-pro-preview": {
+        "provider": "google",
+        "label": "Gemini 3 Pro",
+        "tier": "Higher cost",
+        "description": "Google's flagship reasoning model. More nuanced persona responses, better at complex reasoning.",
+        "input_cost_per_1m": 1.25,
+        "output_cost_per_1m": 5.00,
+    },
+    "gpt-5-mini": {
+        "provider": "openai",
+        "label": "GPT-5 Mini",
+        "tier": "Low cost",
+        "description": "OpenAI's compact model. Fast and capable for persona role-play.",
+        "input_cost_per_1m": 0.25,
+        "output_cost_per_1m": 2.00,
+    },
+    "gpt-5": {
+        "provider": "openai",
+        "label": "GPT-5",
+        "tier": "Higher cost",
+        "description": "OpenAI's flagship model. Best for complex persona reasoning and detailed responses.",
+        "input_cost_per_1m": 1.25,
+        "output_cost_per_1m": 10.00,
+    },
+    "claude-haiku-4-6": {
+        "provider": "anthropic",
+        "label": "Claude Haiku 4.6",
+        "tier": "Low cost",
+        "description": "Anthropic's fast model. Strong at nuanced persona role-play with tight, on-character responses.",
+        "input_cost_per_1m": 1.00,
+        "output_cost_per_1m": 5.00,
+    },
+    "claude-sonnet-4-6": {
+        "provider": "anthropic",
+        "label": "Claude Sonnet 4.6",
+        "tier": "Higher cost",
+        "description": "Anthropic's flagship model. Most thoughtful, in-depth persona responses.",
+        "input_cost_per_1m": 3.00,
+        "output_cost_per_1m": 15.00,
+    },
+}
+
+DEFAULT_MODEL_ID = "gemini-3.1-flash-lite-preview"
+
+
+def estimate_run_cost(model_id, n_personas, prompt_type="reaction"):
+    """Rough cost estimate for a run. Returns (cost_usd, total_tokens_est)."""
+    cfg = MODEL_CONFIGS.get(model_id, MODEL_CONFIGS[DEFAULT_MODEL_ID])
+    # Token estimates per persona call
+    if prompt_type == "survey":
+        in_tokens = 1500
+        out_tokens = 800
+    else:
+        in_tokens = 1100
+        out_tokens = 500
+    total_in = in_tokens * n_personas
+    total_out = out_tokens * n_personas
+    cost = (total_in * cfg["input_cost_per_1m"] / 1_000_000
+            + total_out * cfg["output_cost_per_1m"] / 1_000_000)
+    return cost, total_in + total_out
+
 MAX_WORKERS = 10
 PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "personas.json")
 ADVISOR_PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "advisor_personas.json")
@@ -835,6 +921,185 @@ def render_excel_export_button(label, excel_bytes, filename_prefix, key):
     )
 
 
+
+# ============================================================
+# OPEN-ENDED RESPONSE ANALYSIS HELPERS
+# ============================================================
+
+EXTRA_STOPWORDS = {
+    "would", "could", "should", "really", "actually", "thing", "things",
+    "people", "person", "make", "makes", "made", "get", "got", "getting",
+    "going", "go", "way", "ways", "lot", "lots", "much", "many", "good",
+    "bad", "great", "well", "even", "still", "never", "always", "sometimes",
+    "feel", "feels", "felt", "think", "thought", "thinking", "see", "look",
+    "know", "knew", "want", "wants", "wanted", "need", "needs", "needed",
+    "use", "used", "using", "say", "said", "saying", "tell", "told", "talk",
+    "one", "two", "three", "first", "second", "every", "another", "also",
+    "however", "therefore", "moreover", "though", "since", "because",
+    "instead", "rather", "quite", "very", "pretty", "kind", "sort", "bit",
+    "around", "back", "another", "yes", "no", "maybe", "perhaps",
+    "rbc", "advisor", "client", "clients", "advisors", "im", "ive", "id",
+    "im", "thats", "theres", "youre", "dont", "doesnt", "wont", "cant",
+    "isnt", "arent", "wasnt", "werent", "wouldnt", "couldnt", "shouldnt",
+}
+
+
+def _extract_words(texts, min_length=3):
+    """Tokenize a list of texts into clean lowercase words."""
+    word_re = re.compile(r"[a-zA-Z']+")
+    all_words = []
+    for t in texts:
+        if not isinstance(t, str):
+            continue
+        for w in word_re.findall(t.lower()):
+            w = w.strip("'")
+            if len(w) >= min_length and w not in EXTRA_STOPWORDS:
+                all_words.append(w)
+    return all_words
+
+
+def _extract_ngrams(texts, n=2, min_count=2, top_k=20):
+    """Extract top-k n-grams (bigrams or trigrams) from texts, excluding pure stopword combinations."""
+    word_re = re.compile(r"[a-zA-Z']+")
+    sw = EXTRA_STOPWORDS | (set(WC_STOPWORDS) if WC_STOPWORDS else set())
+    counts = Counter()
+    for t in texts:
+        if not isinstance(t, str):
+            continue
+        words = [w.strip("'") for w in word_re.findall(t.lower())]
+        words = [w for w in words if len(w) >= 2]
+        for i in range(len(words) - n + 1):
+            gram = words[i:i+n]
+            # Skip if all words are stopwords
+            non_sw = [w for w in gram if w not in sw and len(w) >= 3]
+            if len(non_sw) >= max(1, n - 1):
+                counts[" ".join(gram)] += 1
+    return [(g, c) for g, c in counts.most_common(top_k) if c >= min_count]
+
+
+def render_word_cloud(texts, key=None):
+    """Render a word cloud image inside Streamlit. Falls back gracefully if wordcloud unavailable."""
+    if not WORDCLOUD_AVAILABLE:
+        return False
+    words = _extract_words(texts)
+    if len(words) < 5:
+        return False
+    text_blob = " ".join(words)
+    sw = set(WC_STOPWORDS) | EXTRA_STOPWORDS
+    wc = WordCloud(
+        width=900, height=350,
+        background_color="white",
+        colormap="viridis",
+        stopwords=sw,
+        max_words=80,
+        relative_scaling=0.5,
+        collocations=True,
+    ).generate(text_blob)
+    buf = BytesIO()
+    wc.to_image().save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode()
+    st.markdown(
+        f'<img src="data:image/png;base64,{img_b64}" style="width:100%;border-radius:8px;" />',
+        unsafe_allow_html=True
+    )
+    return True
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def summarize_open_ended(question_text, answers_text_blob, audience_label="respondents"):
+    """One LLM call to summarize all open-ended responses to a question.
+    Returns a dict with: headline (str), key_themes (list of str), surprising (str)."""
+    if not answers_text_blob.strip():
+        return None
+    # Trim if too long (prevent runaway token cost)
+    snippet = answers_text_blob[:12000]
+    prompt = (
+        f"Below are open-ended survey responses from {audience_label} answering the question:\n"
+        f"\"{question_text}\"\n\n"
+        f"Respond ONLY with valid JSON in this exact format (no markdown, no code fences):\n"
+        f"{{\n"
+        f'  "headline": "<one-sentence summary of the dominant pattern in the responses>",\n'
+        f'  "key_themes": ["<theme 1 with 1-line description>", "<theme 2>", "<theme 3>", "<theme 4>"],\n'
+        f'  "surprising": "<one notable or surprising insight from the responses, or empty string>",\n'
+        f'  "tactical_takeaway": "<one actionable next step suggested by the responses>"\n'
+        f"}}\n\n"
+        f"RESPONSES:\n{snippet}"
+    )
+    try:
+        text = call_llm(prompt, model_id=DEFAULT_MODEL_ID, response_json=True,
+                        max_tokens=600, temperature=0.3)
+        return parse_json_response(text)
+    except Exception as e:
+        return {"headline": f"Could not summarize: {str(e)[:120]}", "key_themes": [], "surprising": "", "tactical_takeaway": ""}
+
+
+def render_open_ended_panel(question_text, q_df, audience_label="respondents", key_prefix=""):
+    """Render the rich open-ended analysis panel: AI summary, word cloud,
+    key phrases, and representative quotes by sentiment."""
+    answers = [str(a) for a in q_df.get("answer", []) if isinstance(a, str) and a.strip()]
+    if not answers:
+        st.info("No open-ended responses to analyze.")
+        return
+
+    # AI summary - cached so re-renders don't re-call
+    blob = "\n".join(f"- {a[:500]}" for a in answers)
+    with st.spinner("Summarizing responses..."):
+        summary = summarize_open_ended(question_text, blob, audience_label=audience_label)
+
+    if summary:
+        st.markdown(f"### 💡 {summary.get('headline', '')}")
+        themes = summary.get("key_themes", [])
+        if themes:
+            st.markdown("**Key themes:**")
+            for t in themes:
+                st.markdown(f"- {t}")
+        surprising = summary.get("surprising", "")
+        if surprising:
+            st.info(f"**Notable:** {surprising}")
+        tact = summary.get("tactical_takeaway", "")
+        if tact:
+            st.success(f"**Suggested action:** {tact}")
+
+    st.divider()
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.markdown("**☁️ Word Cloud**")
+        rendered = render_word_cloud(answers, key=f"{key_prefix}_wc")
+        if not rendered:
+            st.caption("Word cloud unavailable (wordcloud package not installed or too few words).")
+    with c2:
+        st.markdown("**🔍 Top Phrases (2-3 word)**")
+        bigrams = _extract_ngrams(answers, n=2, min_count=2, top_k=10)
+        trigrams = _extract_ngrams(answers, n=3, min_count=2, top_k=5)
+        all_phrases = bigrams + trigrams
+        if all_phrases:
+            ph_df = pd.DataFrame(all_phrases, columns=["Phrase", "Mentions"])
+            ph_df = ph_df.sort_values("Mentions", ascending=True).tail(15)
+            fig = px.bar(ph_df, x="Mentions", y="Phrase", orientation="h",
+                         color_discrete_sequence=["#2d5a87"], height=350)
+            fig.update_layout(showlegend=False, margin=dict(l=0, r=0, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_phrases")
+        else:
+            st.caption("Not enough repeated phrases to chart.")
+
+    # Representative quotes per sentiment
+    st.markdown("**🗣️ Representative Quotes by Sentiment**")
+    sent_cols = st.columns(3)
+    for i, sentiment in enumerate(["positive", "neutral", "negative"]):
+        with sent_cols[i]:
+            sent_emoji = {"positive": "🟢", "neutral": "⚪", "negative": "🔴"}[sentiment]
+            sent_df = q_df[q_df.get("sentiment", "") == sentiment].head(3)
+            st.markdown(f"{sent_emoji} **{sentiment.title()}** ({(q_df.get('sentiment','') == sentiment).sum()})")
+            if sent_df.empty:
+                st.caption("_No responses_")
+            else:
+                for _, r in sent_df.iterrows():
+                    name = r.get("persona_name", "")
+                    ans = str(r.get("answer", ""))[:300]
+                    st.markdown(f"> *{ans}*  \n— _{name}_")
+
+
 # ============================================================
 # PAGE CONFIG
 # ============================================================
@@ -1060,10 +1325,100 @@ def make_error_result(persona, error_msg):
 
 
 # ============================================================
+# LLM PROVIDER ABSTRACTION
+# ============================================================
+
+def call_llm(prompt, model_id=None, response_json=True, max_tokens=1000, temperature=0.8):
+    """Provider-agnostic LLM call. Returns the text response (string).
+    Routes to OpenAI / Anthropic / Google based on MODEL_CONFIGS[model_id]['provider']."""
+    if not model_id:
+        model_id = DEFAULT_MODEL_ID
+    cfg = MODEL_CONFIGS.get(model_id)
+    if not cfg:
+        # Unknown model — fall back to default
+        cfg = MODEL_CONFIGS[DEFAULT_MODEL_ID]
+        model_id = DEFAULT_MODEL_ID
+    provider = cfg["provider"]
+
+    if provider == "google":
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        gen_cfg_kwargs = {
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+            "thinking_config": types.ThinkingConfig(thinking_budget=0),
+        }
+        if response_json:
+            gen_cfg_kwargs["response_mime_type"] = "application/json"
+        response = client.models.generate_content(
+            model=model_id,
+            contents=prompt,
+            config=types.GenerateContentConfig(**gen_cfg_kwargs),
+        )
+        return response.text.strip()
+
+    elif provider == "openai":
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY not set in secrets.toml")
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        # GPT-5 family uses Responses API and may not accept temperature; use generic chat.completions
+        kwargs = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+        }
+        # GPT-5 family doesn't support custom temperature for some endpoints; use default
+        if not model_id.startswith("gpt-5"):
+            kwargs["temperature"] = temperature
+        if response_json:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content.strip()
+
+    elif provider == "anthropic":
+        if not ANTHROPIC_API_KEY:
+            raise RuntimeError("ANTHROPIC_API_KEY not set in secrets.toml")
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        # Anthropic doesn't have a JSON mode; rely on the prompt's JSON instruction.
+        response = client.messages.create(
+            model=model_id,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        # Anthropic returns content blocks; concatenate text blocks
+        text_parts = []
+        for block in response.content:
+            if hasattr(block, "text"):
+                text_parts.append(block.text)
+        return "".join(text_parts).strip()
+
+    else:
+        raise RuntimeError(f"Unknown provider: {provider}")
+
+
+def parse_json_response(text):
+    """Strip markdown fences and parse JSON. Raises json.JSONDecodeError on failure."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    # Some models wrap JSON in extra text; try to find the JSON object
+    if not text.startswith("{") and not text.startswith("["):
+        # Find first { and last }
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start:end+1]
+    return json.loads(text)
+
+
+# ============================================================
 # API CALLS - REACTOR
 # ============================================================
 
-def get_reaction(client, persona, idea, is_advisor=False, context="", idea_type="investment"):
+def get_reaction(persona, idea, is_advisor=False, context="", idea_type="investment", model_id=None):
     if idea_type == "general":
         prompt_template = ADVISOR_GENERAL_IDEA_PROMPT if is_advisor else GENERAL_IDEA_PROMPT
     else:
@@ -1073,21 +1428,9 @@ def get_reaction(client, persona, idea, is_advisor=False, context="", idea_type=
     prompt = prompt_template.format(persona=persona["persona_summary"], idea=idea, context=ctx_block)
     for attempt in range(3):
         try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.8,
-                    max_output_tokens=1000,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                ),
-            )
-            text = response.text.strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\s*", "", text)
-                text = re.sub(r"\s*```$", "", text)
-            reaction = json.loads(text)
+            text = call_llm(prompt, model_id=model_id, response_json=True,
+                            max_tokens=1000, temperature=0.8)
+            reaction = parse_json_response(text)
             return attach_fn(reaction, persona)
         except json.JSONDecodeError:
             if attempt < 2:
@@ -1095,7 +1438,7 @@ def get_reaction(client, persona, idea, is_advisor=False, context="", idea_type=
                 continue
             return make_error_result(persona, "JSON parse error")
         except Exception as e:
-            if "429" in str(e) or "quota" in str(e).lower():
+            if "429" in str(e) or "quota" in str(e).lower() or "rate" in str(e).lower():
                 time.sleep((attempt + 1) * 10)
                 continue
             if attempt < 2:
@@ -1104,20 +1447,27 @@ def get_reaction(client, persona, idea, is_advisor=False, context="", idea_type=
             return make_error_result(persona, str(e)[:100])
 
 
-def collect_reactions(personas, idea, is_advisor=False, context="", idea_type="investment"):
-    client = genai.Client(api_key=API_KEY)
+def collect_reactions(personas, idea, is_advisor=False, context="", idea_type="investment", model_id=None):
     total = len(personas)
     reactions = []
     completed = 0
     errors = 0
-    delay = 60.0 / 450
+    # Adjust pacing for non-Google providers (lower default rate limits)
+    cfg = MODEL_CONFIGS.get(model_id or DEFAULT_MODEL_ID, {})
+    if cfg.get("provider") in ("openai", "anthropic"):
+        delay = 60.0 / 60   # ~1 req/s
+        max_workers = 5
+    else:
+        delay = 60.0 / 450
+        max_workers = MAX_WORKERS
 
-    progress_bar = st.progress(0, text=f"Starting... 0/{total}")
+    label = MODEL_CONFIGS.get(model_id or DEFAULT_MODEL_ID, {}).get("label", "model")
+    progress_bar = st.progress(0, text=f"Starting ({label})... 0/{total}")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_persona = {}
         for persona in personas:
-            future = executor.submit(get_reaction, client, persona, idea, is_advisor, context, idea_type)
+            future = executor.submit(get_reaction, persona, idea, is_advisor, context, idea_type, model_id)
             future_to_persona[future] = persona
             time.sleep(delay)
 
@@ -1129,10 +1479,10 @@ def collect_reactions(personas, idea, is_advisor=False, context="", idea_type="i
                 errors += 1
             progress_bar.progress(
                 completed / total,
-                text=f"Collected {completed}/{total} reactions ({errors} errors)"
+                text=f"Collected {completed}/{total} reactions ({errors} errors) — {label}"
             )
 
-    progress_bar.progress(1.0, text=f"Done! {total} reactions collected ({errors} errors)")
+    progress_bar.progress(1.0, text=f"Done! {total} reactions collected ({errors} errors) — {label}")
     return reactions
 
 
@@ -1140,7 +1490,7 @@ def collect_reactions(personas, idea, is_advisor=False, context="", idea_type="i
 # API CALLS - SURVEY
 # ============================================================
 
-def get_survey_response(client, persona, questions, is_advisor=False, context=""):
+def get_survey_response(persona, questions, is_advisor=False, context="", model_id=None):
     seed = hash(persona.get("id", persona.get("persona_summary", "")))
     questions_formatted = format_questions_for_prompt(questions, seed=seed)
     prompt_template = ADVISOR_SURVEY_PROMPT if is_advisor else SURVEY_PROMPT
@@ -1151,23 +1501,12 @@ def get_survey_response(client, persona, questions, is_advisor=False, context=""
         questions_formatted=questions_formatted,
         context=ctx_block,
     )
+    max_tok = min(300 * len(questions), 8000)
     for attempt in range(3):
         try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.8,
-                    max_output_tokens=min(300 * len(questions), 8000),
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                ),
-            )
-            text = response.text.strip()
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\s*", "", text)
-                text = re.sub(r"\s*```$", "", text)
-            result = json.loads(text)
+            text = call_llm(prompt, model_id=model_id, response_json=True,
+                            max_tokens=max_tok, temperature=0.8)
+            result = parse_json_response(text)
             return attach_fn(result, persona)
         except json.JSONDecodeError:
             if attempt < 2:
@@ -1175,7 +1514,7 @@ def get_survey_response(client, persona, questions, is_advisor=False, context=""
                 continue
             return make_error_result(persona, "JSON parse error")
         except Exception as e:
-            if "429" in str(e) or "quota" in str(e).lower():
+            if "429" in str(e) or "quota" in str(e).lower() or "rate" in str(e).lower():
                 time.sleep((attempt + 1) * 10)
                 continue
             if attempt < 2:
@@ -1184,20 +1523,26 @@ def get_survey_response(client, persona, questions, is_advisor=False, context=""
             return make_error_result(persona, str(e)[:100])
 
 
-def collect_survey_responses(personas, questions, is_advisor=False, context=""):
-    client = genai.Client(api_key=API_KEY)
+def collect_survey_responses(personas, questions, is_advisor=False, context="", model_id=None):
     total = len(personas)
     responses = []
     completed = 0
     errors = 0
-    delay = 60.0 / 450
+    cfg = MODEL_CONFIGS.get(model_id or DEFAULT_MODEL_ID, {})
+    if cfg.get("provider") in ("openai", "anthropic"):
+        delay = 60.0 / 60
+        max_workers = 5
+    else:
+        delay = 60.0 / 450
+        max_workers = MAX_WORKERS
 
-    progress_bar = st.progress(0, text=f"Starting survey... 0/{total}")
+    label = cfg.get("label", "model")
+    progress_bar = st.progress(0, text=f"Starting survey ({label})... 0/{total}")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_persona = {}
         for persona in personas:
-            future = executor.submit(get_survey_response, client, persona, questions, is_advisor, context)
+            future = executor.submit(get_survey_response, persona, questions, is_advisor, context, model_id)
             future_to_persona[future] = persona
             time.sleep(delay)
 
@@ -1209,10 +1554,10 @@ def collect_survey_responses(personas, questions, is_advisor=False, context=""):
                 errors += 1
             progress_bar.progress(
                 completed / total,
-                text=f"Surveyed {completed}/{total} personas ({errors} errors)"
+                text=f"Surveyed {completed}/{total} personas ({errors} errors) — {label}"
             )
 
-    progress_bar.progress(1.0, text=f"Done! {total} personas surveyed ({errors} errors)")
+    progress_bar.progress(1.0, text=f"Done! {total} personas surveyed ({errors} errors) — {label}")
     return responses
 
 
@@ -1978,6 +2323,14 @@ def show_per_question_analysis(df, per_question, questions):
                 fig.update_layout(height=max(300, len(themes_df) * 28))
                 st.plotly_chart(fig, use_container_width=True, key=f"sq_themes_{qnum}")
 
+            # Rich open-ended analysis (AI summary, word cloud, key phrases, sentiment quotes)
+            if q_type == "open":
+                st.markdown("---")
+                render_open_ended_panel(q_def["text"], q_df,
+                                         audience_label="Canadians",
+                                         key_prefix=f"sq_consumer_{qnum}")
+                st.markdown("---")
+
             # Sentiment by demographics (for open-ended questions)
             if q_type == "open":
                 st.markdown("**Sentiment by Age Group**")
@@ -2516,6 +2869,14 @@ def show_advisor_per_question(df, per_question, key_suffix=""):
             fig.update_layout(xaxis_title="Mentions", yaxis_title="", height=300)
             st.plotly_chart(fig, use_container_width=True, key=f"adv_sq_themes_{qnum}{key_suffix}")
 
+        # Rich open-ended analysis for open-ended advisor questions
+        if q_type == "open":
+            st.markdown("---")
+            audience = "RBC DS advisors" if "rbc" in str(key_suffix).lower() else "advisors"
+            render_open_ended_panel(pq["question"], q_df,
+                                     audience_label=audience,
+                                     key_prefix=f"adv_sq_{qnum}{key_suffix}")
+
         st.divider()
 
 
@@ -2689,16 +3050,59 @@ def render_sidebar(consumer_personas, advisor_personas, rbc_ds_personas, rbc_pim
                     st.caption(f"  {mat}: {count} ({count/len(personas)*100:.0f}%)")
 
         st.divider()
-        st.caption("Powered by Gemini 3.1 Flash-Lite")
 
-    return sample_size, mode, panel, personas
+        # --- Model picker ---
+        st.markdown("**Model**")
+        # Group options by provider for clarity
+        provider_order = ["google", "openai", "anthropic"]
+        model_ids_ordered = []
+        model_labels = []
+        for prov in provider_order:
+            for mid, cfg in MODEL_CONFIGS.items():
+                if cfg["provider"] == prov:
+                    model_ids_ordered.append(mid)
+                    cost_per_50 = (1100 * 50 * cfg["input_cost_per_1m"] / 1_000_000
+                                    + 500 * 50 * cfg["output_cost_per_1m"] / 1_000_000)
+                    model_labels.append(f"{cfg['label']} — {cfg['tier']} (~${cost_per_50:.2f}/50 personas)")
+
+        try:
+            default_idx = model_ids_ordered.index(DEFAULT_MODEL_ID)
+        except ValueError:
+            default_idx = 0
+
+        sel = st.selectbox(
+            "Choose a model",
+            options=range(len(model_ids_ordered)),
+            format_func=lambda i: model_labels[i],
+            index=default_idx,
+            label_visibility="collapsed",
+            help="Compare outputs across providers. Re-run with a different model to see how responses differ."
+        )
+        selected_model_id = model_ids_ordered[sel]
+        selected_cfg = MODEL_CONFIGS[selected_model_id]
+        st.caption(f"_{selected_cfg['description']}_")
+
+        # Show cost estimate for current sample size
+        est_cost, _ = estimate_run_cost(selected_model_id, sample_size, "reaction")
+        st.caption(f"**Est. cost for {sample_size} personas:** ~${est_cost:.3f}")
+
+        # Warn if API key missing
+        if selected_cfg["provider"] == "openai" and not OPENAI_API_KEY:
+            st.warning("OPENAI_API_KEY not set in .streamlit/secrets.toml — this model will fail.", icon="⚠️")
+        elif selected_cfg["provider"] == "anthropic" and not ANTHROPIC_API_KEY:
+            st.warning("ANTHROPIC_API_KEY not set in .streamlit/secrets.toml — this model will fail.", icon="⚠️")
+
+        st.divider()
+        st.caption(f"Powered by {selected_cfg['label']}")
+
+    return sample_size, mode, panel, personas, selected_model_id
 
 
 # ============================================================
 # MODE: IDEA REACTOR
 # ============================================================
 
-def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consumer"):
+def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consumer", model_id=None):
     idea_type = st.radio(
         "Idea Type",
         ["Investment Idea", "General Idea"],
@@ -2765,7 +3169,7 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
         st.info(f"Testing against {len(sampled)} {panel_label} (stratified sample from {len(personas)})")
 
         with st.spinner("Collecting reactions..."):
-            reactions = collect_reactions(sampled, idea.strip(), is_advisor=is_advisor, context=context, idea_type=idea_type_key)
+            reactions = collect_reactions(sampled, idea.strip(), is_advisor=is_advisor, context=context, idea_type=idea_type_key, model_id=model_id)
 
         st.session_state[reactions_key] = reactions
         st.session_state[idea_key] = idea.strip()
@@ -2777,6 +3181,7 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
         log_usage({
             "mode": "Idea Reactor",
             "panel": panel_key,
+            "model_id": model_id or DEFAULT_MODEL_ID,
             "sample_size": len(sampled),
             "api_calls": len(sampled),
             "errors": errors,
@@ -3017,7 +3422,7 @@ def show_ab_comparison(df_a, df_b, analysis_a, analysis_b, idea_a, idea_b):
         st.info(f"**{winner_label}** scored higher by {abs(diff):.1f} points ({pct_diff:.0f}%) across {n} personas.")
 
 
-def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consumer"):
+def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consumer", model_id=None):
     st.title("A/B Test")
     panel_label = "advisors" if is_advisor else "personas"
     st.markdown(f"Compare two ideas or two ways of messaging the same idea. "
@@ -3059,10 +3464,10 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
         st.info(f"Testing both variants against {len(sampled)} {panel_label}...")
 
         st.markdown("**Testing Variant A...**")
-        reactions_a = collect_reactions(sampled, idea_a.strip(), is_advisor=is_advisor, context=context)
+        reactions_a = collect_reactions(sampled, idea_a.strip(), is_advisor=is_advisor, context=context, model_id=model_id)
 
         st.markdown("**Testing Variant B...**")
-        reactions_b = collect_reactions(sampled, idea_b.strip(), is_advisor=is_advisor, context=context)
+        reactions_b = collect_reactions(sampled, idea_b.strip(), is_advisor=is_advisor, context=context, model_id=model_id)
 
         st.session_state[rxa_key] = reactions_a
         st.session_state[rxb_key] = reactions_b
@@ -3074,6 +3479,7 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
         log_usage({
             "mode": "A/B Test",
             "panel": panel_key,
+            "model_id": model_id or DEFAULT_MODEL_ID,
             "sample_size": len(sampled),
             "api_calls": len(sampled) * 2,
             "errors": errors_a + errors_b,
@@ -3167,7 +3573,7 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
 # MODE: SURVEY
 # ============================================================
 
-def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer"):
+def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer", model_id=None):
     if panel_key == "rbc_pim":
         st.title("Survey the RBC DS PIM-Licensed Panel")
         st.markdown("Build your survey below. Great for open-ended questions like \"what content would you want to see at an event?\" or \"what are the best 5 strategies to prospect this group?\"")
@@ -3202,7 +3608,7 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
         st.info(f"Surveying {len(sampled)} {panel_label} with {len(questions)} questions...")
 
         with st.spinner("Collecting survey responses..."):
-            responses = collect_survey_responses(sampled, questions, is_advisor=is_advisor, context=context)
+            responses = collect_survey_responses(sampled, questions, is_advisor=is_advisor, context=context, model_id=model_id)
 
         st.session_state[resp_key] = responses
         st.session_state[q_key] = questions
@@ -3211,6 +3617,7 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
         log_usage({
             "mode": "Survey",
             "panel": panel_key,
+            "model_id": model_id or DEFAULT_MODEL_ID,
             "sample_size": len(sampled),
             "api_calls": len(sampled),
             "errors": errors,
@@ -3418,7 +3825,7 @@ def main():
     advisor_personas = load_advisor_personas()
     rbc_ds_personas = load_rbc_ds_personas()
     rbc_pim_personas = load_rbc_pim_personas()
-    sample_size, mode, panel, personas = render_sidebar(
+    sample_size, mode, panel, personas, model_id = render_sidebar(
         consumer_personas, advisor_personas, rbc_ds_personas, rbc_pim_personas
     )
 
@@ -3434,11 +3841,11 @@ def main():
         panel_key = "consumer"
 
     if mode == "Idea Reactor":
-        run_reactor_mode(personas, sample_size, is_advisor, panel_key)
+        run_reactor_mode(personas, sample_size, is_advisor, panel_key, model_id)
     elif mode == "A/B Test":
-        run_ab_test_mode(personas, sample_size, is_advisor, panel_key)
+        run_ab_test_mode(personas, sample_size, is_advisor, panel_key, model_id)
     else:
-        run_survey_mode(personas, sample_size, is_advisor, panel_key)
+        run_survey_mode(personas, sample_size, is_advisor, panel_key, model_id)
 
 
 if __name__ == "__main__":
