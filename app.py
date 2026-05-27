@@ -45,18 +45,18 @@ GEMINI_API_KEY = API_KEY  # alias for clarity
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
 
-MODEL_NAME = "gemini-3.1-flash-lite-preview"  # default for utility calls (news summarization, etc.)
+MODEL_NAME = "gemini-2.5-flash-lite"  # default for utility calls (news summarization, etc.)
 
 # Model catalog: 2 models per provider (low cost + higher cost) for persona testing.
 # Costs are USD per 1M tokens (input / output) and are best estimates - verify with provider pricing pages.
 MODEL_CONFIGS = {
-    "gemini-3.1-flash-lite-preview": {
+    "gemini-2.5-flash-lite": {
         "provider": "google",
-        "label": "Gemini 3.1 Flash-Lite",
+        "label": "Gemini 2.5 Flash-Lite",
         "tier": "Low cost",
-        "description": "Google's fastest model. Cheap and quick. Good baseline for high-volume persona testing.",
-        "input_cost_per_1m": 0.075,
-        "output_cost_per_1m": 0.30,
+        "description": "Google's cheapest stable model. Fast and inexpensive — good baseline for high-volume persona testing.",
+        "input_cost_per_1m": 0.10,
+        "output_cost_per_1m": 0.40,
     },
     "gemini-2.5-pro": {
         "provider": "google",
@@ -100,7 +100,7 @@ MODEL_CONFIGS = {
     },
 }
 
-DEFAULT_MODEL_ID = "gemini-3.1-flash-lite-preview"
+DEFAULT_MODEL_ID = "gemini-2.5-flash-lite"
 
 
 def estimate_run_cost(model_id, n_personas, prompt_type="reaction"):
