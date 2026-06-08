@@ -388,26 +388,112 @@ def _fuzzy_match_option(selected, options):
 
 INGEST_MAX_CHARS = 60_000  # cap text sent to LLM survey parser
 
-SURVEY_PARSER_PROMPT = """You are parsing a survey instrument document into structured questions.
+SURVEY_PARSER_PROMPT = """You are parsing a Canadian market-research survey instrument into structured questions for a synthetic-persona testing tool.
 
-Return a JSON object with one key "questions" whose value is a list. Each list item is one of:
+Return a JSON object with one key "questions" whose value is a list. Each item is either:
 - {{"type": "open", "text": "..."}}                      for open-ended / free-text questions
 - {{"type": "mc",   "text": "...", "options": [...]}}    for multiple-choice questions
 
-Rules:
-- Preserve the question wording exactly as written.
-- For multiple-choice: include every visible answer option in order. Strip leading numbering like "A.", "1)", "(i)".
-- For Likert / rating-scale questions, encode as "mc" with the scale points as options
-  (e.g. ["Strongly disagree","Disagree","Neutral","Agree","Strongly agree"]).
-- Skip page numbers, branding, section headers/dividers, instructions, and demographic screeners
-  (age/income/gender) unless they are clearly the intended survey question.
-- If the document contains no recognizable questions, return {{"questions": []}}.
-- Return JSON only. No commentary.
+SURVEY-PROGRAMMING MARKUP — IGNORE, DO NOT TURN INTO QUESTIONS OR OPTIONS:
+- Square-bracket tags: [RANDOMIZE], [ANCHOR], [EXCLUSIVE], [SHOW ON ITS OWN PAGE],
+  [SKIP TO NEXT SECTION], [REPEAT FOR ALL ...], [BRING FORWARD ...], [MARK AS "X"],
+  [IF YES], [SKIP IF NO], [PIPE IN], etc.
+- Angle-bracket pipe placeholders: <INSERT JOURNEY STAGE SELECTED IN Q3>, <PIPE IN ...>
+- Parenthetical programming tags like (STAGE 1: AWARENESS) — drop the tag; if the line
+  is the only content of an option, keep the actual option text.
+- Section headers ("SECTION 3:", "Section 5 ..."), intro paragraphs, thank-you blurbs,
+  privacy notices, contact info, "Target length: X minutes".
+- "Other – Please specify ____" / "Other – Please specify _______" → option label "Other".
+- Inline fill-in blanks like "_____" or "_____%" — drop the underscores.
+
+QUESTION-PATTERN RULES:
+
+1. NUMERIC RATING SCALES (0-10 or 1-10 with anchor labels).
+   If you see anchor words like "Poor" and "Excellent" (or "Strongly Disagree" / "Strongly Agree",
+   "Not at all likely" / "Extremely likely") arranged at the ENDS of a numeric scale 0-10 or 1-10,
+   the anchor words are SCALE LABELS, NOT OPTIONS. Encode as ONE "mc" question with the
+   numbers as options, labeling only the endpoints:
+     options: ["0 (Poor)", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10 (Excellent)"]
+   Never include "Poor" or "Excellent" as standalone options.
+
+2. LIKERT AGREEMENT SCALES.
+   "Strongly disagree / Disagree / Neutral / Agree / Strongly agree" → 5 options as-is.
+
+3. MATRIX / GRID QUESTIONS.
+   When you see "Please rate the following statements ... Select one only for each statement"
+   followed by a list of statements + a single shared scale, EXPAND into ONE question PER
+   STATEMENT. Each child question uses the format:
+     text: "<Stem>: <Statement>"
+     options: <the shared scale>
+
+4. "Select all that apply" / "Select up to three".
+   Still encode as type "mc" — the persona will pick one but the question text should preserve
+   the "Select all that apply" / "Select up to three" instruction.
+
+5. NUMERIC FREE-TEXT inputs ("provide a percentage between 0% and 100%", "______").
+   Encode as type "open" with the question wording — the persona will type a number.
+
+6. EMAIL or CONTACT capture questions.
+   Skip these — they are not interesting for synthetic-persona testing.
+
+7. CONDITIONAL ROUTING / SKIP LOGIC.
+   Ignore conditional headers like "IF ANONYMOUS:" — emit the underlying question or skip
+   if it is purely a routing instruction.
+
+EXAMPLE INPUT:
+  Thinking about all your experiences with Mackenzie, how would you rate your overall experience? Select one only.
+  Poor [0] [1] [2] [3] [4] [5] [6] [7] [8] [9] [10] Excellent
+
+EXAMPLE OUTPUT:
+  {{"type":"mc","text":"Thinking about all your experiences with Mackenzie, how would you rate your overall experience? Select one only.",
+    "options":["0 (Poor)","1","2","3","4","5","6","7","8","9","10 (Excellent)"]}}
+
+EXAMPLE INPUT:
+  Please rate your level of agreement with the following statements about Mackenzie. Select one only for each statement.
+   - Mackenzie communicates well with me
+   - Mackenzie's products fit my clients
+  Scale: Strongly Disagree, Disagree, Neutral, Agree, Strongly Agree
+
+EXAMPLE OUTPUT:
+  {{"type":"mc","text":"Please rate your level of agreement: Mackenzie communicates well with me",
+    "options":["Strongly Disagree","Disagree","Neutral","Agree","Strongly Agree"]}}
+  {{"type":"mc","text":"Please rate your level of agreement: Mackenzie's products fit my clients",
+    "options":["Strongly Disagree","Disagree","Neutral","Agree","Strongly Agree"]}}
+
+Skip these example pseudo-questions when parsing the actual document.
+
+If the document contains no recognizable questions, return {{"questions": []}}.
+Return JSON only. No commentary.
 
 DOCUMENT TEXT:
 {text}
 
 JSON:"""
+
+
+def _clean_survey_text(text):
+    """Strip survey-programming markup before sending to the LLM. Deterministic preprocessing
+    that handles the common Qualtrics-style annotations the parser would otherwise treat as content."""
+    if not text:
+        return text
+    # Square-bracket markup: [RANDOMIZE], [ANCHOR], [EXCLUSIVE, ANCHOR], [SHOW ON ITS OWN PAGE], etc.
+    text = re.sub(r"\[[^\[\]\n]{1,200}\]", "", text)
+    # Angle-bracket pipe placeholders: <INSERT JOURNEY STAGE SELECTED IN Q3>
+    text = re.sub(r"<[^<>\n]{1,200}>", "", text)
+    # Parenthetical stage / journey-stage tags: "(STAGE 1: AWARENESS, RELEVANCE & OPPORTUNITY EXPLORATION)"
+    text = re.sub(r"\(STAGE\s*\d+[^)]*\)", "", text, flags=re.IGNORECASE)
+    # Fill-in blanks like _____ or _____% — collapse to nothing
+    text = re.sub(r"_{3,}%?", "", text)
+    # "Other – Please specify ..." → "Other"
+    text = re.sub(r"(?i)other\s*[-–—]\s*please specify[^\n]*", "Other", text)
+    # SECTION N: ... headers on their own line
+    text = re.sub(r"(?im)^\s*SECTION\s*\d+:[^\n]*\n?", "", text)
+    text = re.sub(r"(?im)^\s*SUBSECTION\b[^\n]*\n?", "", text)
+    # Routing instructions on their own line
+    text = re.sub(r"(?im)^\s*(SKIP\b|MENTION\b|IF\s+(YES|NO|ANONYMOUS)\b)[^\n]*\n?", "", text)
+    # Collapse blank-line runs
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def extract_text_from_upload(uploaded_file):
@@ -452,14 +538,17 @@ def parse_survey_doc_to_questions(text, model_id=None):
     """
     if not text or not text.strip():
         return []
-    snippet = text.strip()
+    # Strip survey-programming markup before the LLM sees it. Deterministic.
+    snippet = _clean_survey_text(text)
     if len(snippet) > INGEST_MAX_CHARS:
         snippet = snippet[:INGEST_MAX_CHARS]
     prompt = SURVEY_PARSER_PROMPT.format(text=snippet)
     # Always use the default low-cost model for ingestion regardless of the
     # persona-run model the user selected — this keeps parsing free/fast.
+    # Bigger budget than other utility calls: real surveys with matrix expansion
+    # routinely emit 50+ questions, each ~100 output tokens.
     raw = call_llm(prompt, model_id=DEFAULT_MODEL_ID, response_json=True,
-                   max_tokens=4000, temperature=0.1)
+                   max_tokens=12000, temperature=0.1)
     try:
         data = parse_json_response(raw)
     except Exception as e:
@@ -484,7 +573,10 @@ def parse_survey_doc_to_questions(text, model_id=None):
                 # Degenerate MC -> treat as open-ended so it stays usable.
                 q["type"] = "open"
             else:
-                q["options"] = opts[:8]   # builder caps at 8 options
+                # Allow up to 20 options so 0-10 rating scales and long
+                # demographic lists survive. The builder renders any count
+                # and only disables the "+ Add Option" button past 8.
+                q["options"] = opts[:20]
         cleaned.append(q)
     return cleaned
 
@@ -517,48 +609,123 @@ def _render_doc_uploader_for_text(panel_key, slot_id, target_state_key, label):
 
 
 def _render_doc_uploader_for_survey(panel_key, model_id):
-    """File uploader that LLM-parses an uploaded survey document into structured
-    questions and APPENDS them to the question builder."""
+    """Upload a survey document and stage its parsed questions in a preview pane.
+    The user reviews / drops bad questions before any of them land in the builder."""
     uploader_key = f"{panel_key}_upload_survey"
     marker_key = f"{panel_key}_uploaded_marker_survey"
     up = st.file_uploader(
         "Upload a survey document (PDF, DOCX, TXT) — auto-extracts questions",
         type=["pdf", "docx", "txt", "md"],
         key=uploader_key,
-        help="The app parses the document and adds its questions to the builder below. You can edit before running.",
+        help="The app parses the document and shows a preview below. You decide which questions to add to the builder.",
     )
-    if up is None:
-        return
-    if st.session_state.get(marker_key) == up.name:
-        return
-    try:
-        text = extract_text_from_upload(up)
-    except Exception as e:
-        st.error(f"Couldn't read {up.name}: {e}")
-        return
-    if not text or not text.strip():
-        st.warning(f"No text could be extracted from {up.name}.")
-        return
-    with st.spinner(f"Parsing {up.name} into questions..."):
+    if up is not None and st.session_state.get(marker_key) != up.name:
         try:
-            parsed = parse_survey_doc_to_questions(text, model_id=model_id)
+            text = extract_text_from_upload(up)
         except Exception as e:
-            st.error(f"Couldn't parse {up.name}: {e}")
-            return
+            st.error(f"Couldn't read {up.name}: {e}")
+        else:
+            if not text or not text.strip():
+                st.warning(f"No text could be extracted from {up.name}.")
+            else:
+                with st.spinner(f"Parsing {up.name} into questions..."):
+                    try:
+                        parsed = parse_survey_doc_to_questions(text, model_id=model_id)
+                    except Exception as e:
+                        st.error(f"Couldn't parse {up.name}: {e}")
+                        parsed = None
+                if parsed is not None:
+                    if not parsed:
+                        st.warning(f"No questions were detected in {up.name}.")
+                    else:
+                        st.session_state[f"{panel_key}_parsed_preview"] = parsed
+                        st.session_state[f"{panel_key}_parsed_preview_decisions"] = {q["id"]: True for q in parsed}
+                        st.session_state[f"{panel_key}_parsed_preview_filename"] = up.name
+                        st.session_state[marker_key] = up.name
+                        st.rerun()
+
+    # If there's a staged preview waiting for review, render it.
+    _render_survey_preview(panel_key)
+
+
+def _render_survey_preview(panel_key):
+    """Render the staged preview of parsed questions with keep/drop checkboxes
+    and an 'Add selected to builder' button."""
+    preview_key = f"{panel_key}_parsed_preview"
+    decisions_key = f"{panel_key}_parsed_preview_decisions"
+    filename_key = f"{panel_key}_parsed_preview_filename"
+    parsed = st.session_state.get(preview_key, [])
     if not parsed:
-        st.warning(f"No questions were detected in {up.name}.")
         return
-    builder_key = f"{panel_key}_question_builder"
-    counter_key = f"{panel_key}_q_counter"
-    existing = st.session_state.get(builder_key, [])
-    base_id = st.session_state.get(counter_key, 0)
-    for j, q in enumerate(parsed, 1):
-        q["id"] = base_id + j
-    st.session_state[builder_key] = list(existing) + parsed
-    st.session_state[counter_key] = base_id + len(parsed)
-    st.session_state[marker_key] = up.name
-    st.success(f"Added {len(parsed)} question(s) from {up.name} to the builder. Edit as needed before running.")
-    st.rerun()
+
+    decisions = st.session_state.setdefault(decisions_key, {q["id"]: True for q in parsed})
+    fname = st.session_state.get(filename_key, "uploaded document")
+
+    with st.container(border=True):
+        kept_count = sum(1 for q in parsed if decisions.get(q["id"], True))
+        st.markdown(f"### Review {len(parsed)} parsed question(s) from `{fname}`")
+        st.caption(f"{kept_count} of {len(parsed)} selected. Uncheck anything that looks wrong, then add the rest to the builder where you can do final edits.")
+
+        bc1, bc2, bc3 = st.columns([1, 1, 2])
+        with bc1:
+            if st.button("Select all", key=f"{panel_key}_preview_all", use_container_width=True):
+                for q in parsed:
+                    decisions[q["id"]] = True
+                st.rerun()
+        with bc2:
+            if st.button("Deselect all", key=f"{panel_key}_preview_none", use_container_width=True):
+                for q in parsed:
+                    decisions[q["id"]] = False
+                st.rerun()
+        with bc3:
+            if st.button("Discard this preview", key=f"{panel_key}_preview_discard", use_container_width=True):
+                for k in (preview_key, decisions_key, filename_key):
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+        st.divider()
+
+        for q in parsed:
+            qid = q["id"]
+            keep_col, body_col = st.columns([0.7, 9])
+            with keep_col:
+                decisions[qid] = st.checkbox(
+                    "Keep",
+                    value=decisions.get(qid, True),
+                    key=f"{panel_key}_preview_keep_{qid}",
+                    label_visibility="collapsed",
+                )
+            with body_col:
+                qtype_label = "Multiple Choice" if q["type"] == "mc" else "Open-Ended"
+                st.markdown(f"**[{qtype_label}]** {q['text']}")
+                if q["type"] == "mc":
+                    n = len(q.get("options", []))
+                    preview_opts = ", ".join(q.get("options", [])[:6])
+                    if n > 6:
+                        preview_opts += f", ... ({n} options total)"
+                    st.caption(preview_opts)
+            st.markdown("")  # tight spacer
+
+        st.divider()
+        add_col, _ = st.columns([2, 6])
+        with add_col:
+            disabled = kept_count == 0
+            if st.button(f"Add {kept_count} question(s) to builder",
+                         type="primary", key=f"{panel_key}_preview_add",
+                         disabled=disabled, use_container_width=True):
+                keep = [q for q in parsed if decisions.get(q["id"], True)]
+                builder_key = f"{panel_key}_question_builder"
+                counter_key = f"{panel_key}_q_counter"
+                existing = st.session_state.get(builder_key, [])
+                base_id = st.session_state.get(counter_key, 0)
+                for j, q in enumerate(keep, 1):
+                    q["id"] = base_id + j
+                st.session_state[builder_key] = list(existing) + keep
+                st.session_state[counter_key] = base_id + len(keep)
+                for k in (preview_key, decisions_key, filename_key):
+                    st.session_state.pop(k, None)
+                st.success(f"Added {len(keep)} question(s) to the builder.")
+                st.rerun()
 
 
 def format_questions_for_prompt(questions, seed=None):
