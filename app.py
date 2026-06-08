@@ -382,6 +382,185 @@ def _fuzzy_match_option(selected, options):
     return best_opt
 
 
+# ============================================================
+# DOCUMENT INGESTION (upload PDF / DOCX / TXT and extract content)
+# ============================================================
+
+INGEST_MAX_CHARS = 60_000  # cap text sent to LLM survey parser
+
+SURVEY_PARSER_PROMPT = """You are parsing a survey instrument document into structured questions.
+
+Return a JSON object with one key "questions" whose value is a list. Each list item is one of:
+- {{"type": "open", "text": "..."}}                      for open-ended / free-text questions
+- {{"type": "mc",   "text": "...", "options": [...]}}    for multiple-choice questions
+
+Rules:
+- Preserve the question wording exactly as written.
+- For multiple-choice: include every visible answer option in order. Strip leading numbering like "A.", "1)", "(i)".
+- For Likert / rating-scale questions, encode as "mc" with the scale points as options
+  (e.g. ["Strongly disagree","Disagree","Neutral","Agree","Strongly agree"]).
+- Skip page numbers, branding, section headers/dividers, instructions, and demographic screeners
+  (age/income/gender) unless they are clearly the intended survey question.
+- If the document contains no recognizable questions, return {{"questions": []}}.
+- Return JSON only. No commentary.
+
+DOCUMENT TEXT:
+{text}
+
+JSON:"""
+
+
+def extract_text_from_upload(uploaded_file):
+    """Extract text from a Streamlit UploadedFile (PDF, DOCX, TXT, or MD).
+    Raises ValueError if the file type is unsupported."""
+    name = (uploaded_file.name or "").lower()
+    if name.endswith(".pdf"):
+        from pypdf import PdfReader
+        reader = PdfReader(uploaded_file)
+        parts = []
+        for page in reader.pages:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                continue
+        return "\n".join(parts).strip()
+    if name.endswith(".docx"):
+        from docx import Document
+        doc = Document(uploaded_file)
+        parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+        # Some surveys use tables — flatten cell text too.
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    t = cell.text.strip()
+                    if t:
+                        parts.append(t)
+        return "\n".join(parts).strip()
+    if name.endswith((".txt", ".md")):
+        data = uploaded_file.read()
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", errors="replace")
+        return data.strip()
+    raise ValueError(f"Unsupported file type: {uploaded_file.name}. Use PDF, DOCX, TXT, or MD.")
+
+
+def parse_survey_doc_to_questions(text, model_id=None):
+    """LLM-parse extracted survey text into the question-builder schema.
+
+    Returns a list of dicts: each {"id": int, "type": "open"|"mc", "text": str,
+    "options": list[str] (if mc)}. Raises ValueError if parsing fails.
+    """
+    if not text or not text.strip():
+        return []
+    snippet = text.strip()
+    if len(snippet) > INGEST_MAX_CHARS:
+        snippet = snippet[:INGEST_MAX_CHARS]
+    prompt = SURVEY_PARSER_PROMPT.format(text=snippet)
+    # Always use the default low-cost model for ingestion regardless of the
+    # persona-run model the user selected — this keeps parsing free/fast.
+    raw = call_llm(prompt, model_id=DEFAULT_MODEL_ID, response_json=True,
+                   max_tokens=4000, temperature=0.1)
+    try:
+        data = parse_json_response(raw)
+    except Exception as e:
+        raise ValueError(f"LLM returned invalid JSON while parsing survey doc: {e}")
+    items = data.get("questions") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise ValueError("LLM response did not contain a 'questions' list.")
+
+    cleaned = []
+    for i, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            continue
+        qtype = (item.get("type") or "").lower()
+        qtext = (item.get("text") or "").strip()
+        if not qtext or qtype not in ("open", "mc"):
+            continue
+        q = {"id": i, "type": qtype, "text": qtext}
+        if qtype == "mc":
+            opts = item.get("options") or []
+            opts = [str(o).strip() for o in opts if str(o).strip()]
+            if len(opts) < 2:
+                # Degenerate MC -> treat as open-ended so it stays usable.
+                q["type"] = "open"
+            else:
+                q["options"] = opts[:8]   # builder caps at 8 options
+        cleaned.append(q)
+    return cleaned
+
+
+def _render_doc_uploader_for_text(panel_key, slot_id, target_state_key, label):
+    """File uploader that, on a NEW upload, extracts text from the document
+    and writes it into st.session_state[target_state_key], then reruns so
+    the downstream text_area picks up the new value as its initial value."""
+    uploader_key = f"{panel_key}_upload_{slot_id}"
+    marker_key = f"{panel_key}_uploaded_marker_{slot_id}"
+    up = st.file_uploader(label, type=["pdf", "docx", "txt", "md"],
+                          key=uploader_key,
+                          help="PDF, DOCX, TXT, or Markdown. Text is auto-extracted into the field below.")
+    if up is None:
+        return
+    if st.session_state.get(marker_key) == up.name:
+        return
+    try:
+        text = extract_text_from_upload(up)
+    except Exception as e:
+        st.error(f"Couldn't read {up.name}: {e}")
+        return
+    if not text or not text.strip():
+        st.warning(f"No text could be extracted from {up.name}.")
+        return
+    st.session_state[target_state_key] = text
+    st.session_state[marker_key] = up.name
+    st.success(f"Loaded {len(text):,} characters from {up.name}. Edit as needed before running.")
+    st.rerun()
+
+
+def _render_doc_uploader_for_survey(panel_key, model_id):
+    """File uploader that LLM-parses an uploaded survey document into structured
+    questions and APPENDS them to the question builder."""
+    uploader_key = f"{panel_key}_upload_survey"
+    marker_key = f"{panel_key}_uploaded_marker_survey"
+    up = st.file_uploader(
+        "Upload a survey document (PDF, DOCX, TXT) — auto-extracts questions",
+        type=["pdf", "docx", "txt", "md"],
+        key=uploader_key,
+        help="The app parses the document and adds its questions to the builder below. You can edit before running.",
+    )
+    if up is None:
+        return
+    if st.session_state.get(marker_key) == up.name:
+        return
+    try:
+        text = extract_text_from_upload(up)
+    except Exception as e:
+        st.error(f"Couldn't read {up.name}: {e}")
+        return
+    if not text or not text.strip():
+        st.warning(f"No text could be extracted from {up.name}.")
+        return
+    with st.spinner(f"Parsing {up.name} into questions..."):
+        try:
+            parsed = parse_survey_doc_to_questions(text, model_id=model_id)
+        except Exception as e:
+            st.error(f"Couldn't parse {up.name}: {e}")
+            return
+    if not parsed:
+        st.warning(f"No questions were detected in {up.name}.")
+        return
+    builder_key = f"{panel_key}_question_builder"
+    counter_key = f"{panel_key}_q_counter"
+    existing = st.session_state.get(builder_key, [])
+    base_id = st.session_state.get(counter_key, 0)
+    for j, q in enumerate(parsed, 1):
+        q["id"] = base_id + j
+    st.session_state[builder_key] = list(existing) + parsed
+    st.session_state[counter_key] = base_id + len(parsed)
+    st.session_state[marker_key] = up.name
+    st.success(f"Added {len(parsed)} question(s) from {up.name} to the builder. Edit as needed before running.")
+    st.rerun()
+
+
 def format_questions_for_prompt(questions, seed=None):
     """Format structured questions for the LLM prompt.
 
@@ -3204,7 +3383,17 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
 
     context = render_context_panel(panel_key)
 
-    idea = st.text_area(idea_label, height=150, placeholder=placeholder)
+    idea_state_key = f"{panel_key}_reactor_idea_input"
+    with st.expander("Or upload a document (PDF / DOCX / TXT) to auto-fill the idea", expanded=False):
+        _render_doc_uploader_for_text(
+            panel_key, "reactor_idea", idea_state_key,
+            label="Upload a document",
+        )
+
+    idea = st.text_area(
+        idea_label, height=150, placeholder=placeholder,
+        key=idea_state_key,
+    )
 
     col1, col2 = st.columns([1, 4])
     with col1:
@@ -3487,12 +3676,22 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
 
     c1, c2 = st.columns(2)
     with c1:
+        with st.expander("Or upload a document for Variant A", expanded=False):
+            _render_doc_uploader_for_text(
+                panel_key, "ab_a", f"{panel_key}_ab_idea_a_input",
+                label="Upload Variant A document (PDF / DOCX / TXT)",
+            )
         idea_a = st.text_area(
             "Variant A", height=150,
             placeholder="Enter the first variant of your idea...",
             key=f"{panel_key}_ab_idea_a_input",
         )
     with c2:
+        with st.expander("Or upload a document for Variant B", expanded=False):
+            _render_doc_uploader_for_text(
+                panel_key, "ab_b", f"{panel_key}_ab_idea_b_input",
+                label="Upload Variant B document (PDF / DOCX / TXT)",
+            )
         idea_b = st.text_area(
             "Variant B", height=150,
             placeholder="Enter the second variant of your idea...",
@@ -3643,6 +3842,8 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
         st.markdown("Build your survey below. Add open-ended or multiple-choice questions using the buttons.")
 
     context = render_context_panel(panel_key)
+
+    _render_doc_uploader_for_survey(panel_key, model_id)
 
     questions = render_question_builder(panel_key)
 
