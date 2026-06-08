@@ -124,6 +124,36 @@ PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "personas.json")
 ADVISOR_PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "advisor_personas.json")
 RBC_DS_PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "rbc_ds_personas.json")
 RBC_PIM_PERSONAS_FILE = os.path.join(os.path.dirname(__file__), "rbc_pim_personas.json")
+
+# Other big-bank IIROC dealer panels (real advisor data from public sources).
+# Each entry: panel_name -> (panel_key, json_filename).
+BANK_IIROC_FIRM_FILES = {
+    "BMO Nesbitt Burns":          ("bmo",    "bmo_nesbitt_burns_personas.json"),
+    "CIBC Wood Gundy":            ("cibc",   "cibc_wood_gundy_personas.json"),
+    "TD Wealth":                  ("td",     "td_wealth_personas.json"),
+    "National Bank Financial WM": ("nbf",    "nbf_wm_personas.json"),
+    "Scotia Wealth":              ("scotia", "scotia_wealth_personas.json"),
+}
+
+# Panel keys that share the RBC-style real-advisor code paths:
+# stratified_sample_rbc, demographics expander, advisor-tone placeholders, etc.
+REAL_ADVISOR_PANEL_KEYS = {
+    "rbc_ds", "rbc_pim", "bank_iiroc", "bmo", "cibc", "td", "nbf", "scotia",
+}
+
+# Display labels used in page titles, e.g. "Test Your Idea with <X>".
+ADVISOR_PANEL_AUDIENCE = {
+    "advisor":    "Canadian Financial Advisors",
+    "rbc_ds":     "RBC Dominion Securities Advisors",
+    "rbc_pim":    "RBC DS PIM-Licensed Advisors",
+    "bank_iiroc": "Bank IIROC Advisors",
+    "bmo":        "BMO Nesbitt Burns Advisors",
+    "cibc":       "CIBC Wood Gundy Advisors",
+    "td":         "TD Wealth Advisors",
+    "nbf":        "National Bank Financial Advisors",
+    "scotia":     "Scotia Wealth Advisors",
+}
+
 USAGE_LOG_FILE = os.path.join(os.path.dirname(__file__), "usage_log.json")
 ADMIN_SECRET = st.secrets.get("ADMIN_KEY", "persona-reactor-admin-2024")
 COST_PER_API_CALL = 0.0001  # Estimated cost per Gemini Flash-Lite call (USD)
@@ -1163,6 +1193,32 @@ def load_rbc_pim_personas():
             return json.load(f)
     except FileNotFoundError:
         return []
+
+
+def _load_persona_file(filename):
+    """Load a JSON persona file from the app directory. Empty list if missing."""
+    path = os.path.join(os.path.dirname(__file__), filename)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
+def load_bank_iiroc_firms():
+    """Load the 5 non-RBC big-bank IIROC firm panels. Returns {panel_name: [personas]}."""
+    out = {}
+    for panel_name, (_key, filename) in BANK_IIROC_FIRM_FILES.items():
+        out[panel_name] = _load_persona_file(filename)
+    return out
+
+
+def load_bank_iiroc_all(rbc_ds_personas, firm_personas_by_panel):
+    """Combine RBC DS + all 5 non-RBC firms into one aggregate Bank IIROC panel."""
+    combined = list(rbc_ds_personas)
+    for personas in firm_personas_by_panel.values():
+        combined.extend(personas)
+    return combined
 
 
 # ============================================================
@@ -2942,7 +2998,9 @@ def show_advisor_survey_data(df, key_suffix=""):
 # SIDEBAR
 # ============================================================
 
-def render_sidebar(consumer_personas, advisor_personas, rbc_ds_personas, rbc_pim_personas):
+def render_sidebar(panel_personas):
+    """Sidebar UI. `panel_personas` is an ordered dict of panel_name -> persona list;
+    the radio options come from its keys in insertion order."""
     with st.sidebar:
         st.title("Synthetic Persona Reactor")
         st.caption("Test ideas, run surveys and do A/B testing against investor and advisor personas")
@@ -2950,13 +3008,14 @@ def render_sidebar(consumer_personas, advisor_personas, rbc_ds_personas, rbc_pim
 
         panel = st.radio(
             "Panel",
-            ["Canadians as a Whole", "Financial Advisors", "RBC DS - All", "RBC DS - PIM Licensed"],
+            list(panel_personas.keys()),
             horizontal=False,
             help=(
                 "Canadians as a Whole: 1000 synthetic Canadian investors. "
                 "Financial Advisors: 1000 synthetic Canadian advisors. "
-                "RBC DS - All: real RBC Dominion Securities advisor panel (from public sources). "
-                "RBC DS - PIM Licensed: subset of RBC DS advisors with discretionary licence."
+                "Bank IIROC (All Firms): aggregate of all 6 big-bank IIROC dealer panels. "
+                "RBC DS / BMO Nesbitt Burns / CIBC Wood Gundy / TD Wealth / NBF WM / Scotia Wealth: "
+                "real advisor panels for each firm (from public sources)."
             ),
         )
 
@@ -2971,16 +3030,7 @@ def render_sidebar(consumer_personas, advisor_personas, rbc_ds_personas, rbc_pim
 
         st.divider()
 
-        if panel == "Canadians as a Whole":
-            personas = consumer_personas
-        elif panel == "Financial Advisors":
-            personas = advisor_personas
-        elif panel == "RBC DS - All":
-            personas = rbc_ds_personas
-        elif panel == "RBC DS - PIM Licensed":
-            personas = rbc_pim_personas
-        else:
-            personas = consumer_personas
+        personas = panel_personas.get(panel) or next(iter(panel_personas.values()))
 
         sample_size = st.slider(
             "Sample Size",
@@ -3003,13 +3053,20 @@ def render_sidebar(consumer_personas, advisor_personas, rbc_ds_personas, rbc_pim
                 st.caption("**Ethnicities:**")
                 for eth, count in ethnicities.most_common(6):
                     st.caption(f"  {eth}: {count} ({count/len(personas)*100:.0f}%)")
-            elif panel in ("RBC DS - All", "RBC DS - PIM Licensed"):
+            elif panel in {"RBC DS - All", "RBC DS - PIM Licensed", "Bank IIROC (All Firms)"} | set(BANK_IIROC_FIRM_FILES.keys()):
                 st.caption(f"**Total advisors available:** {len(personas)}")
+                # Firm breakdown — only meaningful when the panel mixes firms.
+                if panel == "Bank IIROC (All Firms)":
+                    firms = Counter(p.get("firm_type", "Unknown") for p in personas)
+                    st.caption("**Firms in panel:**")
+                    for firm, count in firms.most_common():
+                        st.caption(f"  {firm}: {count} ({count/len(personas)*100:.0f}%)")
                 provinces = Counter(p.get("province", "Unknown") for p in personas)
                 st.caption("**Top provinces:**")
                 for prov, count in provinces.most_common(8):
                     st.caption(f"  {prov}: {count} ({count/len(personas)*100:.0f}%)")
-                if panel == "RBC DS - All":
+                # Show PIM mix for any non-PIM-filtered panel.
+                if panel != "RBC DS - PIM Licensed":
                     pim_counts = Counter(p.get("pim_licensed", "Unknown") for p in personas)
                     st.caption("**PIM / Discretionary:**")
                     for pim, count in pim_counts.most_common():
@@ -3116,12 +3173,7 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
     idea_type_key = "investment" if idea_type == "Investment Idea" else "general"
 
     # Determine the panel label for titles
-    if panel_key == "rbc_pim":
-        advisor_audience = "RBC DS PIM-Licensed Advisors"
-    elif panel_key == "rbc_ds":
-        advisor_audience = "RBC Dominion Securities Advisors"
-    else:
-        advisor_audience = "Canadian Financial Advisors"
+    advisor_audience = ADVISOR_PANEL_AUDIENCE.get(panel_key, "Canadian Financial Advisors")
 
     if idea_type_key == "general":
         if is_advisor:
@@ -3131,7 +3183,7 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
             st.title("Test Your Idea")
             st.markdown("Describe your idea below and get reactions from a demographically representative panel of Canadians.")
         idea_label = "Your Idea / Concept / Proposal"
-        if panel_key in ("rbc_ds", "rbc_pim"):
+        if panel_key in REAL_ADVISOR_PANEL_KEYS:
             placeholder = "Example: A half-day event featuring a Bank of Canada economist, a private equity fund manager, and a tax planning expert — aimed at UHNW client prospecting..."
         else:
             placeholder = "Example: A community-based car sharing program for suburban neighbourhoods, where residents share vehicles through a mobile app with insurance included..."
@@ -3140,7 +3192,7 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
             st.title(f"Test Your Idea with {advisor_audience}")
             st.markdown(f"Describe your idea below and get professional reactions from a panel of {advisor_audience}.")
             idea_label = "Idea / Product / Concept"
-            if panel_key in ("rbc_ds", "rbc_pim"):
+            if panel_key in REAL_ADVISOR_PANEL_KEYS:
                 placeholder = "Example: A new alternative investment platform offering private credit and real estate debt funds with quarterly liquidity, aimed at discretionary PIM books..."
             else:
                 placeholder = "Example: A new alternative investment platform offering private credit and real estate debt funds with quarterly liquidity, targeting accredited investors with $100K+ minimums..."
@@ -3166,7 +3218,7 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
     idea_key = f"{panel_key}_idea"
 
     if run_button and idea.strip():
-        sample_fn = (stratified_sample_rbc if panel_key in ("rbc_ds", "rbc_pim") else (stratified_sample_advisors if is_advisor else stratified_sample))
+        sample_fn = (stratified_sample_rbc if panel_key in REAL_ADVISOR_PANEL_KEYS else (stratified_sample_advisors if is_advisor else stratified_sample))
         sampled = sample_fn(personas, sample_size)
         panel_label = "advisors" if is_advisor else "personas"
         st.info(f"Testing against {len(sampled)} {panel_label} (stratified sample from {len(personas)})")
@@ -3462,7 +3514,7 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
     idb_key = f"{panel_key}_ab_idea_b"
 
     if run_button and both_filled:
-        sample_fn = (stratified_sample_rbc if panel_key in ("rbc_ds", "rbc_pim") else (stratified_sample_advisors if is_advisor else stratified_sample))
+        sample_fn = (stratified_sample_rbc if panel_key in REAL_ADVISOR_PANEL_KEYS else (stratified_sample_advisors if is_advisor else stratified_sample))
         sampled = sample_fn(personas, sample_size)
         st.info(f"Testing both variants against {len(sampled)} {panel_label}...")
 
@@ -3577,11 +3629,11 @@ def run_ab_test_mode(personas, sample_size, is_advisor=False, panel_key="consume
 # ============================================================
 
 def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer", model_id=None):
-    if panel_key == "rbc_pim":
-        st.title("Survey the RBC DS PIM-Licensed Panel")
-        st.markdown("Build your survey below. Great for open-ended questions like \"what content would you want to see at an event?\" or \"what are the best 5 strategies to prospect this group?\"")
-    elif panel_key == "rbc_ds":
-        st.title("Survey the RBC Dominion Securities Panel")
+    if panel_key in REAL_ADVISOR_PANEL_KEYS:
+        audience = ADVISOR_PANEL_AUDIENCE.get(panel_key, "Canadian Financial Advisors")
+        # Strip trailing " Advisors" for natural reading in the title.
+        panel_title = audience[:-len(" Advisors")] if audience.endswith(" Advisors") else audience
+        st.title(f"Survey the {panel_title} Panel")
         st.markdown("Build your survey below. Great for open-ended questions like \"what content would you want to see at an event?\" or \"what are the best 5 strategies to prospect this group?\"")
     elif is_advisor:
         st.title("Survey Your Advisor Panel")
@@ -3606,7 +3658,7 @@ def run_survey_mode(personas, sample_size, is_advisor=False, panel_key="consumer
     q_key = f"{panel_key}_survey_questions"
 
     if run_button and questions:
-        sample_fn = (stratified_sample_rbc if panel_key in ("rbc_ds", "rbc_pim") else (stratified_sample_advisors if is_advisor else stratified_sample))
+        sample_fn = (stratified_sample_rbc if panel_key in REAL_ADVISOR_PANEL_KEYS else (stratified_sample_advisors if is_advisor else stratified_sample))
         sampled = sample_fn(personas, sample_size)
         st.info(f"Surveying {len(sampled)} {panel_label} with {len(questions)} questions...")
 
@@ -3828,20 +3880,34 @@ def main():
     advisor_personas = load_advisor_personas()
     rbc_ds_personas = load_rbc_ds_personas()
     rbc_pim_personas = load_rbc_pim_personas()
-    sample_size, mode, panel, personas, model_id = render_sidebar(
-        consumer_personas, advisor_personas, rbc_ds_personas, rbc_pim_personas
-    )
+    firm_personas = load_bank_iiroc_firms()  # 5 non-RBC big-bank IIROC panels
+    bank_iiroc_all = load_bank_iiroc_all(rbc_ds_personas, firm_personas)
 
-    advisor_panels = {"Financial Advisors", "RBC DS - All", "RBC DS - PIM Licensed"}
-    is_advisor = panel in advisor_panels
-    if panel == "Financial Advisors":
-        panel_key = "advisor"
-    elif panel == "RBC DS - All":
-        panel_key = "rbc_ds"
-    elif panel == "RBC DS - PIM Licensed":
-        panel_key = "rbc_pim"
-    else:
-        panel_key = "consumer"
+    # Ordered: investor -> synthetic advisor -> Bank IIROC aggregate -> per-firm panels.
+    panel_personas = {
+        "Canadians as a Whole":     consumer_personas,
+        "Financial Advisors":       advisor_personas,
+        "Bank IIROC (All Firms)":   bank_iiroc_all,
+        "RBC DS - All":             rbc_ds_personas,
+        "RBC DS - PIM Licensed":    rbc_pim_personas,
+    }
+    panel_personas.update(firm_personas)  # BMO, CIBC, TD, NBF, Scotia
+
+    sample_size, mode, panel, personas, model_id = render_sidebar(panel_personas)
+
+    # Map UI panel name -> panel_key used for state, audience labels, dispatch.
+    panel_key_map = {
+        "Canadians as a Whole":   "consumer",
+        "Financial Advisors":     "advisor",
+        "Bank IIROC (All Firms)": "bank_iiroc",
+        "RBC DS - All":           "rbc_ds",
+        "RBC DS - PIM Licensed":  "rbc_pim",
+    }
+    for firm_name, (key, _file) in BANK_IIROC_FIRM_FILES.items():
+        panel_key_map[firm_name] = key
+    panel_key = panel_key_map.get(panel, "consumer")
+
+    is_advisor = panel_key in ({"advisor"} | REAL_ADVISOR_PANEL_KEYS)
 
     if mode == "Idea Reactor":
         run_reactor_mode(personas, sample_size, is_advisor, panel_key, model_id)
