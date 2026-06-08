@@ -2690,16 +2690,14 @@ SUITABILITY_COLORS = {"unsuitable": "#e74c3c", "niche": "#f39c12", "moderate": "
 def show_advisor_overview(df, key_suffix=""):
     """Overview metrics for advisor reactions."""
     st.subheader("Key Metrics")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     avg_score = df["interest_score"].mean()
-    recommend_pct = df["would_recommend"].mean() * 100 if "would_recommend" in df.columns else 0
     top_sentiment = df["sentiment"].mode().iloc[0] if len(df) > 0 else "N/A"
     median_score = df["interest_score"].median()
 
     col1.metric("Avg Interest Score", f"{avg_score:.1f}/10")
-    col2.metric("Would Recommend", f"{recommend_pct:.0f}%")
-    col3.metric("Top Sentiment", top_sentiment.capitalize())
-    col4.metric("Median Score", f"{median_score:.1f}/10")
+    col2.metric("Top Sentiment", top_sentiment.capitalize())
+    col3.metric("Median Score", f"{median_score:.1f}/10")
 
     st.divider()
 
@@ -2735,13 +2733,12 @@ def show_advisor_demographics(df, key_suffix=""):
     """Demographic breakdowns for advisor reactions."""
     st.subheader("Professional Breakdowns")
 
-    # By Years in Business
+    # Row 1: Experience level | Top 5 most-interested branches (by city)
     c1, c2 = st.columns(2)
     with c1:
         if "years_group" in df.columns:
             group_data = df.groupby("years_group", observed=True).agg(
                 avg_score=("interest_score", "mean"),
-                recommend_pct=("would_recommend", lambda x: x.mean() * 100),
                 count=("interest_score", "size"),
             ).reset_index()
             fig = go.Figure()
@@ -2751,14 +2748,30 @@ def show_advisor_demographics(df, key_suffix=""):
             st.plotly_chart(fig, use_container_width=True, key=f"adv_yrs_score{key_suffix}")
 
     with c2:
-        if "years_group" in df.columns:
-            fig = go.Figure()
-            fig.add_trace(go.Bar(x=group_data["years_group"], y=group_data["recommend_pct"],
-                                  name="% Recommend", marker_color="#27ae60"))
-            fig.update_layout(title="% Would Recommend by Experience", yaxis_title="% Recommend")
-            st.plotly_chart(fig, use_container_width=True, key=f"adv_yrs_rec{key_suffix}")
+        if "city" in df.columns:
+            city_data = df.groupby("city").agg(
+                avg_score=("interest_score", "mean"),
+                count=("interest_score", "size"),
+            ).reset_index()
+            # Filter out "Unknown" and tiny strata so the ranking is meaningful.
+            city_data = city_data[city_data["city"].astype(str).str.lower() != "unknown"]
+            city_data = city_data[city_data["count"] >= 3]
+            top5 = city_data.sort_values("avg_score", ascending=False).head(5)
+            if not top5.empty:
+                # Sort ascending so the highest bar appears at the top of the horizontal chart.
+                top5 = top5.sort_values("avg_score", ascending=True)
+                fig = px.bar(
+                    top5, y="city", x="avg_score", orientation="h",
+                    title="Top 5 Most Interested Branches (by city, n≥3)",
+                    color_discrete_sequence=["#16a085"],
+                    hover_data={"count": True, "avg_score": ":.2f"},
+                )
+                fig.update_layout(xaxis_title="Avg Interest Score", yaxis_title="")
+                st.plotly_chart(fig, use_container_width=True, key=f"adv_branch_top5{key_suffix}")
+            else:
+                st.caption("Not enough cities with ≥3 advisors to rank branches.")
 
-    # By Firm Type
+    # Row 2: Firm type | Practice focus
     c1, c2 = st.columns(2)
     with c1:
         if "firm_type" in df.columns:
@@ -2772,32 +2785,6 @@ def show_advisor_demographics(df, key_suffix=""):
             st.plotly_chart(fig, use_container_width=True, key=f"adv_firm_score{key_suffix}")
 
     with c2:
-        if "book_size_group" in df.columns:
-            book_data = df.groupby("book_size_group", observed=True).agg(
-                avg_score=("interest_score", "mean"),
-                recommend_pct=("would_recommend", lambda x: x.mean() * 100),
-                count=("interest_score", "size"),
-            ).reset_index()
-            fig = go.Figure()
-            fig.add_trace(go.Bar(x=book_data["book_size_group"], y=book_data["avg_score"],
-                                  name="Avg Score", marker_color="#8e44ad"))
-            fig.update_layout(title="Interest by Book Size", yaxis_title="Avg Score")
-            st.plotly_chart(fig, use_container_width=True, key=f"adv_book_score{key_suffix}")
-
-    # By Province and Practice Focus
-    c1, c2 = st.columns(2)
-    with c1:
-        if "province" in df.columns:
-            prov_data = df.groupby("province").agg(
-                avg_score=("interest_score", "mean"),
-                count=("interest_score", "size"),
-            ).sort_values("count", ascending=False).head(6).sort_values("avg_score", ascending=True).reset_index()
-            fig = px.bar(prov_data, y="province", x="avg_score", orientation="h",
-                         title="Interest by Province (Top 6)", color_discrete_sequence=["#16a085"])
-            fig.update_layout(xaxis_title="Avg Score", yaxis_title="")
-            st.plotly_chart(fig, use_container_width=True, key=f"adv_prov_score{key_suffix}")
-
-    with c2:
         if "practice_focus" in df.columns:
             focus_data = df.groupby("practice_focus").agg(
                 avg_score=("interest_score", "mean"),
@@ -2807,6 +2794,174 @@ def show_advisor_demographics(df, key_suffix=""):
                          title="Interest by Practice Focus", color_discrete_sequence=["#e67e22"])
             fig.update_layout(xaxis_title="Avg Score", yaxis_title="")
             st.plotly_chart(fig, use_container_width=True, key=f"adv_focus_score{key_suffix}")
+
+    # Row 3: Province (full width)
+    if "province" in df.columns:
+        prov_data = df.groupby("province").agg(
+            avg_score=("interest_score", "mean"),
+            count=("interest_score", "size"),
+        ).sort_values("count", ascending=False).head(6).sort_values("avg_score", ascending=True).reset_index()
+        fig = px.bar(prov_data, y="province", x="avg_score", orientation="h",
+                     title="Interest by Province (Top 6)", color_discrete_sequence=["#16a085"])
+        fig.update_layout(xaxis_title="Avg Score", yaxis_title="")
+        st.plotly_chart(fig, use_container_width=True, key=f"adv_prov_score{key_suffix}")
+
+
+CONCERN_CATEGORY_PROMPT = """You are categorizing concerns raised by Canadian financial advisors who evaluated an idea.
+
+Group the concerns below into 4-8 distinct THEMATIC categories. Each category name should be a short noun phrase (2-5 words) capturing the underlying theme — NOT a verbatim quote.
+
+Good category-name examples: "Fees & Costs", "Liquidity & Lock-up", "Regulatory & Compliance", "Client Suitability", "Track Record & Performance", "Operational Complexity", "Tax Treatment", "Education & Communication".
+
+Rules:
+- Every concern must be assigned to exactly one category.
+- Use the original concern wording verbatim in the "members" lists (do not rephrase).
+- Return JSON only, no commentary, in this shape:
+  {{"categories": [{{"name": "<category>", "members": ["<original concern>", ...]}}, ...]}}
+
+CONCERNS TO GROUP:
+{concerns_list}
+
+JSON:"""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def categorize_concerns(concerns_tuple):
+    """Group raw concern strings into thematic categories via one LLM call.
+
+    Input: tuple of (concern_text, count) — must be hashable for caching.
+    Output: list of (category_name, total_count, [member_concerns]) sorted by count.
+    Falls back to raw concerns if the LLM call or parse fails.
+    """
+    if not concerns_tuple:
+        return []
+    concerns = list(concerns_tuple)
+    if len(concerns) <= 3:
+        # Too few to bother grouping.
+        return [(c, n, [c]) for c, n in concerns]
+    flat = "\n".join(f"- {c} (mentioned {n} time{'s' if n != 1 else ''})" for c, n in concerns)
+    try:
+        raw = call_llm(
+            CONCERN_CATEGORY_PROMPT.format(concerns_list=flat),
+            model_id=DEFAULT_MODEL_ID, response_json=True,
+            max_tokens=2000, temperature=0.2,
+        )
+        data = parse_json_response(raw)
+    except Exception:
+        return [(c, n, [c]) for c, n in concerns]
+    cats = data.get("categories", []) if isinstance(data, dict) else []
+    counts_by_concern = dict(concerns)
+    result = []
+    for cat in cats:
+        name = (cat.get("name") or "").strip()
+        members = [str(m).strip() for m in (cat.get("members") or []) if str(m).strip()]
+        if not name or not members:
+            continue
+        # Match each member to its source concern (case-insensitive contains match).
+        matched_total = 0
+        matched_members = []
+        unmatched = []
+        for m in members:
+            m_low = m.lower()
+            found = None
+            for src, n in concerns:
+                if src.lower() == m_low or m_low in src.lower() or src.lower() in m_low:
+                    found = (src, n)
+                    break
+            if found:
+                matched_total += found[1]
+                matched_members.append(found[0])
+            else:
+                unmatched.append(m)
+        # If the LLM made up a member that didn't match anything original, count it as 1.
+        for m in unmatched:
+            matched_total += 1
+            matched_members.append(m)
+        if matched_total > 0 and matched_members:
+            result.append((name, matched_total, matched_members))
+    if not result:
+        return [(c, n, [c]) for c, n in concerns]
+    result.sort(key=lambda x: -x[1])
+    return result
+
+
+def show_advisor_insights(df, analysis, key_suffix=""):
+    """Insights for advisor reactions: feedback word cloud + thematically grouped concerns
+    + top appeal factors + what would help."""
+    st.subheader("Key Insights")
+
+    # --- Feedback word cloud ---
+    st.markdown("**Feedback Word Cloud**")
+    feedback_blob = []
+    for _, row in df.iterrows():
+        for col in ("gut_reaction", "verbatim_quote", "what_would_help"):
+            v = row.get(col)
+            if isinstance(v, str) and v.strip():
+                feedback_blob.append(v)
+        for col in ("key_concerns", "appeal_factors"):
+            v = row.get(col)
+            if isinstance(v, list):
+                feedback_blob.extend(str(x) for x in v if x)
+    rendered = render_word_cloud(feedback_blob, key=f"adv_insight_wc{key_suffix}")
+    if not rendered:
+        st.caption("Word cloud unavailable (too few words or wordcloud package missing).")
+
+    st.divider()
+
+    # --- Grouped concerns ---
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Most Common Concerns (grouped by theme)**")
+        raw_concerns = analysis.get("top_concerns") or []
+        if raw_concerns:
+            with st.spinner("Grouping concerns by theme..."):
+                grouped = categorize_concerns(tuple(raw_concerns))
+            if grouped:
+                cat_df = pd.DataFrame(
+                    [(name, total) for name, total, _ in grouped[:8]],
+                    columns=["Theme", "Mentions"],
+                )
+                fig = px.bar(
+                    cat_df.iloc[::-1], x="Mentions", y="Theme",
+                    color_discrete_sequence=["#e74c3c"],
+                    orientation="h",
+                    title="Concern Themes",
+                )
+                fig.update_layout(height=400, yaxis_title="")
+                st.plotly_chart(fig, use_container_width=True, key=f"adv_insight_concerns{key_suffix}")
+                with st.expander("See which verbatim concerns rolled up into each theme"):
+                    for name, total, members in grouped[:8]:
+                        st.markdown(f"**{name}** — {total} mention(s)")
+                        for m in members:
+                            st.caption(f"  • {m}")
+            else:
+                st.caption("No concerns to group.")
+        else:
+            st.caption("No concerns recorded.")
+
+    with c2:
+        st.markdown("**Top Appeal Factors**")
+        appeals = analysis.get("top_appeals") or []
+        if appeals:
+            appeal_df = pd.DataFrame(appeals, columns=["Appeal", "Mentions"])
+            fig = px.bar(
+                appeal_df.iloc[::-1], x="Mentions", y="Appeal",
+                color_discrete_sequence=["#2ecc71"],
+                orientation="h",
+                title="Most Common Appeal Factors",
+            )
+            fig.update_layout(height=400, yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True, key=f"adv_insight_appeals{key_suffix}")
+        else:
+            st.caption("No appeals recorded.")
+
+    st.markdown("**What Would Make Advisors More Likely to Recommend**")
+    helps = analysis.get("what_would_help") or []
+    if helps:
+        for h, count in Counter(helps).most_common(15):
+            st.markdown(f"- {h} *({count})*")
+    else:
+        st.caption("No suggestions recorded.")
 
 
 def show_advisor_quotes(df, key_suffix=""):
@@ -3475,7 +3630,7 @@ def run_reactor_mode(personas, sample_size, is_advisor=False, panel_key="consume
             with tab2:
                 show_advisor_demographics(df)
             with tab3:
-                show_insights(df, analysis)
+                show_advisor_insights(df, analysis)
             with tab4:
                 show_advisor_quotes(df)
             with tab5:
